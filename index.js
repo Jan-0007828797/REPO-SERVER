@@ -1,9 +1,10 @@
-
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -15,387 +16,930 @@ app.get("/health", (req,res)=> res.json({ ok:true, ts: Date.now() }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: true, methods: ["GET","POST"] } });
 
-const games = new Map();
+/**
+ * Kryptopoly v3.2 (spec-aligned)
+ * - GM is the only one who advances steps/phases/years.
+ * - App does not decide winners for ML or Auction; it only collects bids and shows them.
+ * - Server keeps the single source of truth for:
+ *   - players, state (year/phase/bizStep), locks for movement, trends seed, inventories
+ *   - committed flags + stored values, so clients can refresh and stay consistent
+ */
 
 function now(){ return Date.now(); }
 function shortId(){ return uuidv4().slice(0,8); }
 function clampPlayers(n){ n=Number(n); if(!Number.isFinite(n)) return 1; return Math.max(1, Math.min(6, Math.floor(n))); }
 function clampYears(n){ n=Number(n); if(!Number.isFinite(n)) return 4; return (n===5?5:4); }
-function initialPrices(){ return { BTC:100, ETH:50, LTC:20, SIA:5 }; }
 function shuffle(arr){ const a=[...arr]; for(let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+function pickRandom(arr, k){ return shuffle(arr).slice(0,k); }
 
+const continents = ["EUROPE","ASIA","AFRICA","N_AMERICA","S_AMERICA","OCEANIA"];
+const markets12 = Array.from({length:12}, (_,i)=>`M${String(i+1).padStart(2,"0")}`);
+
+// Simple catalog (test) – cards are identified by QR payload == cardId
 const CATALOG = (() => {
-  const continents = ["EUROPE","ASIA","AFRICA","N_AMERICA","S_AMERICA","OCEANIA"];
-  const markets12 = Array.from({length:12}, (_,i)=>`M${String(i+1).padStart(2,"0")}`);
   const types = ["AGRO","INDUSTRY","MINING","ENERGY","TECH","LOGISTICS"];
   const investments = Array.from({length:48}, (_,i)=>{
     const n=i+1;
-    return { cardId:`TI${String(n).padStart(3,"0")}`, name:`Tradiční investice ${n}`, continent: continents[i % continents.length], market: markets12[i % markets12.length], type: types[i % types.length], usdProduction: 2 + (n % 7) };
+    return {
+      cardId:`TI${String(n).padStart(3,"0")}`,
+      kind:"INVESTMENT",
+      name:`Tradiční investice ${n}`,
+      continent: continents[i % continents.length],
+      market: markets12[i % markets12.length],
+      type: types[i % types.length],
+      usdProduction: 2 + (n % 7)
+    };
   });
   const crypto = ["BTC","ETH","LTC","SIA"];
   const miningFarms = Array.from({length:4}, (_,i)=>{
     const n=i+1;
-    return { cardId:`MF${String(n).padStart(3,"0")}`, name:`Mining farma ${n}`, crypto: crypto[i], cryptoProduction: 1 + (n%2), electricityUSD: 2 + n };
+    return {
+      cardId:`MF${String(n).padStart(3,"0")}`,
+      kind:"MINING_FARM",
+      name:`Mining farma ${n}`,
+      crypto: crypto[i],
+      cryptoProduction: 1 + (n%2),
+      electricityUSD: 2 + n
+    };
   });
   const expertFuncs = [
     ["ANALYST","Analytik","Odhalí 3 globální trendy nejbližšího skrytého roku."],
     ["CRYPTOGURU","Kryptoguru","Odhalí kryptotrend nejbližšího skrytého roku."],
     ["LAWYER_TRENDS","Právník","Zruší negativní dopad globálních trendů (test verze)."],
-    ["LOBBY_LASTCALL","Lobbista","V obálce uvidíš nabídky ostatních a dáš finální nabídku."]
+    ["LOBBY_LASTCALL","Lobbista","V obálce uvidíš nabídky ostatních a dáš finální nabídku."],
+    ["STEAL_BASE_PROD","Lobbista (krádež)","Přesune základní USD produkci vybrané investice (jen tento rok)."],
   ];
   const experts = Array.from({length:30}, (_,i)=>{
     const n=i+1;
     const f = expertFuncs[i % expertFuncs.length];
-    return { cardId:`EX${String(n).padStart(3,"0")}`, name:`Expert ${f[1]} ${Math.floor(i/expertFuncs.length)+1}`, function:f[0], functionLabel:f[1], functionDesc:f[2] };
+    return {
+      cardId:`EX${String(n).padStart(3,"0")}`,
+      kind:"EXPERT",
+      name:`Expert ${f[1]} ${Math.floor(i/expertFuncs.length)+1}`,
+      functionKey:f[0],
+      functionLabel:f[1],
+      functionDesc:f[2]
+    };
   });
-  const globalTrends = [
-    { key:"ENERGY_CRISIS", name:"Energetická krize", effect:{ type:"ELECTRICITY_MULT", params:{ mult:1.5 } } },
-    { key:"GREEN_SUBSIDY", name:"Zelené dotace", effect:{ type:"ALL_USD_BONUS", params:{ usd:1 } } },
-    { key:"INFLATION", name:"Inflace", effect:{ type:"ALL_USD_PENALTY", params:{ usd:-1 } } },
-    { key:"INVESTOR_FRENZY", name:"Investorská euforie", effect:{ type:"ALL_USD_BONUS", params:{ usd:2 } } },
-    { key:"BANK_TIGHTEN", name:"Utahování politiky", effect:{ type:"ALL_USD_PENALTY", params:{ usd:-2 } } },
-    { key:"DROUGHT", name:"Sucho", effect:{ type:"AGRO_PENALTY", params:{ usd:-2 } } },
+
+  
+function loadGlobalTrends(){
+  try{
+    const p = path.join(__dirname, "data", "globalTrends.json");
+    const raw = fs.readFileSync(p, "utf-8");
+    const arr = JSON.parse(raw);
+    if(Array.isArray(arr) && arr.length>0) return arr;
+  }catch(e){}
+  // Fallback (should not happen in deploy)
+  return [
+    { key:"ENERGY_CRISIS", name:"Energetická krize", icon:"⚡", desc:"Rychlý růst ceny energie." }
   ];
-  const regionalTrends = Object.fromEntries(continents.map(c=>[c, [
-    { key:`${c}_GROWTH`, name:"Regionální růst", effect:{ type:"REGION_BONUS", params:{ usd:2 } } },
-    { key:`${c}_SLOW`, name:"Regionální zpomalení", effect:{ type:"REGION_PENALTY", params:{ usd:-2 } } },
-    { key:`${c}_INFRA`, name:"Infrastruktura", effect:{ type:"REGION_BONUS", params:{ usd:1 } } },
-    { key:`${c}_CRISIS`, name:"Regionální krize", effect:{ type:"REGION_PENALTY", params:{ usd:-1 } } },
-  ]]));
-  const cryptoTrends = [
-    { key:"UP", name:"Krypto roste" },
-    { key:"DOWN", name:"Krypto padá" },
-    { key:"FLAT", name:"Krypto stagnuje" },
+}
+
+function loadCryptoTrends(){
+  try{
+    const p = path.join(__dirname, "data", "cryptoTrends.json");
+    const raw = fs.readFileSync(p, "utf-8");
+    const arr = JSON.parse(raw);
+    if(Array.isArray(arr) && arr.length>0) return arr;
+  }catch(e){}
+  return [
+    { key:"CRYPTO_TREND_1", name:"Kryptotrend 1", coeff:{ BTC:1, ETH:1, LTC:1, SIA:1 } }
   ];
-  return { investments, miningFarms, experts, globalTrends, regionalTrends, cryptoTrends, continents, markets12 };
+}
+
+// Trends pool (minimal for test)
+  const globalTrends = loadGlobalTrends();
+
+  // Regionální trendy – 4 možnosti dle pravidel:
+  // - Investiční boom: do dražební položky lze přidat +1 Tradiční investici
+  // - Vysoká vzdělanost: do dražební položky lze přidat +1 Experta
+  // - Stabilita: bez vlivu
+  // - Daně: při vstupu na kontinent hráč platí 3× cenová hladina (lze chránit Právníkem v MOVE)
+  // Pozn.: pro test appky jsou zde trendy primárně informační (hráči vyhodnocují mimo aplikaci),
+  // ale poskytujeme popis a možnost ochrany (Daně) pro konzistentní UX.
+  const regionalBase = [
+    {
+      key:"REG_INVESTMENT_BOOM",
+      name:"Investiční boom",
+      icon:"📈",
+      desc:"Do dražební položky může hráč přidat o jednu Tradiční investici navíc z balíčku.",
+      lawyer:{ allowed:false }
+    },
+    {
+      key:"REG_HIGH_EDUCATION",
+      name:"Vysoká vzdělanost",
+      icon:"🎓",
+      desc:"Do dražební položky může hráč přidat o jednoho Experta navíc z balíčku.",
+      lawyer:{ allowed:false }
+    },
+    {
+      key:"REG_STABILITY",
+      name:"Stabilita",
+      icon:"🛡️",
+      desc:"Nejsou žádné vlivy.",
+      lawyer:{ allowed:false }
+    },
+    {
+      key:"REG_TAXES",
+      name:"Daně",
+      icon:"💸",
+      desc:"Hráč, který skončí svůj pohyb na daném kontinentu, zaplatí okamžitě trojnásobek cenové hladiny dle aktuální cenové hladiny. Účinku se lze vyhnout funkcí Právníka.",
+      lawyer:{ allowed:true, phase:"BIZ_MOVE_ONLY" }
+    }
+  ];
+  const regionalTrends = Object.fromEntries(
+    continents.map(c=>[c, regionalBase.map(t=>({ ...t, key:`${c}_${t.key}` }))])
+  );
+  const cryptoTrends = loadCryptoTrends();
+
+
+  const markets = markets12.map((m, idx)=>({
+    marketId: m,
+    label: `Trh ${idx+1}`,
+    continent: continents[idx % continents.length],
+    type: ["AGRO","INDUSTRY","MINING","ENERGY","TECH","LOGISTICS"][idx % 6]
+  }));
+
+  return { investments, miningFarms, experts, globalTrends, regionalTrends, cryptoTrends, continents, markets };
 })();
 
-function pickRandom(arr, k){ return shuffle(arr).slice(0,k); }
-function generateSeed(yearsTotal){
-  const years = [];
+function generateTrends(yearsTotal){
+  const years = {};
   for(let y=1;y<=yearsTotal;y++){
-    const globals = pickRandom(CATALOG.globalTrends, 3).map(t=>({ ...t, trendId: uuidv4(), year:y, kind:"GLOBAL", revealed: y===1 }));
-    const crypto = pickRandom(CATALOG.cryptoTrends, 1)[0];
-    const cryptoObj = { ...crypto, trendId: uuidv4(), year:y, kind:"CRYPTO", revealed: y===1 };
-    const regionals = Object.entries(CATALOG.regionalTrends).map(([continent, list])=>{
-      const t = pickRandom(list, 1)[0];
-      return { ...t, trendId: uuidv4(), year:y, kind:"REGIONAL", region:continent, revealed: y===1 };
-    });
-    years.push({ year:y, globals, crypto: cryptoObj, regionals });
+    const globals = pickRandom(CATALOG.globalTrends, 3).map(t=>({ ...t, trendId: uuidv4(), year:y, kind:"GLOBAL" }));
+    const crypto = { ...pickRandom(CATALOG.cryptoTrends, 1)[0], trendId: uuidv4(), year:y, kind:"CRYPTO" };
+    const regional = {};
+    for(const [continent, list] of Object.entries(CATALOG.regionalTrends)){
+      regional[continent] = { ...pickRandom(list,1)[0], trendId: uuidv4(), year:y, kind:"REGIONAL", continent };
+    }
+    years[String(y)] = { year:y, globals, crypto, regional };
   }
-  return { years };
-}
-function applyCryptoTrend(prices, t){
-  const key = t?.key || "FLAT";
-  const mult = key==="UP" ? 1.2 : key==="DOWN" ? 0.8 : 1.0;
-  const out = {};
-  for(const k of Object.keys(prices)){ out[k] = Math.max(1, Math.round(prices[k]*mult)); }
-  return out;
-}
-function defaultClockSeconds(){ return 60; }
-function publicGameState(game){
-  return { gameId: game.gameId, config: game.config, status: game.status, fsm: game.fsm,
-    players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, market:p.market, wallet:p.wallet })),
-    seed: game.seed, assets: game.assets, prices: game.prices, stepData: game.stepData || {} };
-}
-function broadcast(game){ io.to(`game:${game.gameId}`).emit("game_state", publicGameState(game)); }
-function setStep(game, phase, step){ game.fsm.phase=phase; game.fsm.step=step; game.fsm.stepStartedAt=now(); game.fsm.timerEndsAt=null; game.stepData={}; }
-function startTimer(game, seconds){ game.fsm.timerEndsAt = now() + seconds*1000; }
-function timerLeft(game){ if(!game.fsm.timerEndsAt) return null; return Math.max(0, Math.ceil((game.fsm.timerEndsAt - now())/1000)); }
-
-function resolveTimer(game){
-  if(timerLeft(game)!==0) return;
-  const step = game.fsm.step;
-  if(step==="F1_ML_BID"){ for(const p of game.players){ if(game.stepData.mlBids?.[p.playerId]==null) game.stepData.mlBids[p.playerId]={bid:null,ts:now()}; } resolveML(game); }
-  if(step==="F1_MOVE"){ for(const p of game.players){ if(game.stepData.moves?.[p.playerId]==null) game.stepData.moves[p.playerId]={marketId:p.market?.marketId||null,continent:p.market?.continent||null,ts:now()}; } resolveMoves(game); }
-  if(step==="F1_ENVELOPE"){ for(const p of game.players){ if(game.stepData.envelope?.[p.playerId]==null) game.stepData.envelope[p.playerId]={bid:null,usedLobby:false,ts:now(),finalBid:null}; } resolveEnvelope(game); }
-  if(step==="F1_LOBBY_LASTCALL"){ resolveEnvelope(game); }
-  if(step==="F2_CRYPTO"){ for(const p of game.players){ if(game.stepData.crypto?.[p.playerId]==null) game.stepData.crypto[p.playerId]={trades:{},confirm:true,ts:now()}; } resolveCrypto(game); }
-  if(step==="F3_CLOSE"){ for(const p of game.players){ if(game.stepData.close?.[p.playerId]==null) game.stepData.close[p.playerId]={confirm:true,ts:now()}; } resolveSettlement(game); }
+  return { seed: uuidv4(), yearsTotal, byYear: years };
 }
 
-function resolveML(game){
-  const bids = Object.entries(game.stepData.mlBids||{}).map(([pid,v])=>({ pid, bid: v.bid==null ? -1 : Number(v.bid), ts: v.ts }));
-  bids.sort((a,b)=> (b.bid-a.bid) || (a.ts-b.ts));
-  const winner = bids[0];
-  game.meta.currentML = (winner && winner.bid>=0) ? winner.pid : game.players.find(p=>p.role==="GM")?.playerId;
-  setStep(game, 1, "F1_MOVE"); game.stepData.moves={}; startTimer(game, defaultClockSeconds()); broadcast(game);
-}
-function resolveMoves(game){ setStep(game, 1, "F1_ENVELOPE"); game.stepData.envelope={}; startTimer(game, defaultClockSeconds()); broadcast(game); }
+// Game store
+const games = new Map();
 
-function resolveEnvelope(game){
-  const pool = game.meta.deckInvestments;
-  const item = game.stepData.currentAuctionItem || pool.shift();
-  game.stepData.currentAuctionItem = item;
-  const bids = game.stepData.envelope || {};
-  let best = null;
-  for(const [pid, v] of Object.entries(bids)){
-    const offer = v.usedLobby ? (v.finalBid==null? v.bid : v.finalBid) : v.bid;
-    const bid = offer==null ? -1 : Number(offer);
-    const ts = v.ts || now();
-    if(best==null || bid>best.bid || (bid===best.bid && ts<best.ts) || (bid===best.bid && pid===game.meta.currentML)){ best = { pid, bid, ts }; }
-  }
-  game.stepData.auctionResult = { card: item, wonBy: (best && best.bid>=0) ? best.pid : null, bid: (best && best.bid>=0)? best.bid : null };
-  setStep(game, 1, "F1_SCAN"); game.stepData.scan={open:true}; broadcast(game);
+function makePlayer(name, role){
+  return {
+    playerId: shortId(),
+    name: String(name||"").slice(0,32) || "Hráč",
+    role,
+    joinedAt: now(),
+    marketId: null,
+    wallet: { usd: 0, crypto: { BTC:3, ETH:3, LTC:3, SIA:3 } }
+  };
 }
 
-function resolveCrypto(game){
-  const yearObj = game.seed.years.find(y=>y.year===game.fsm.year);
-  game.prices = applyCryptoTrend(game.prices, yearObj.crypto);
-  for(const p of game.players){
-    const entry = game.stepData.crypto[p.playerId] || { trades:{}, confirm:true };
-    for(const sym of Object.keys(game.prices)){
-      const delta = Number(entry.trades?.[sym]||0);
-      if(delta<0){ const sell = Math.min(p.wallet[sym]||0, Math.abs(delta)); p.wallet[sym]=(p.wallet[sym]||0)-sell; }
-      else if(delta>0){ const buy = Math.min(10, delta); p.wallet[sym]=(p.wallet[sym]||0)+buy; }
+function blankInventory(){
+  return { investments: [], miningFarms: [], experts: [] };
+}
+
+function newGame({ gmName, yearsTotal, maxPlayers }){
+  const gameId = shortId();
+  const gm = makePlayer(gmName, "GM");
+
+  const game = {
+    gameId,
+    status: "LOBBY",
+    config: { yearsTotal: clampYears(yearsTotal), maxPlayers: clampPlayers(maxPlayers) },
+    createdAt: now(),
+    players: [gm],
+
+    trends: null,
+    reveals: {},
+
+    lawyer: { protections: {}, notices: {} },
+
+    inventory: { [gm.playerId]: blankInventory() },
+    availableCards: {
+      investments: new Set(CATALOG.investments.map(c=>c.cardId)),
+      miningFarms: new Set(CATALOG.miningFarms.map(c=>c.cardId)),
+      experts: new Set(CATALOG.experts.map(c=>c.cardId)),
+    },
+
+    year: 0,
+    phase: null,      // "BIZ"|"CRYPTO"|"SETTLE"
+    bizStep: null,    // "TRENDS"|"ML_BID"|"MOVE"|"AUCTION_ENVELOPE"
+
+    // committed values – purely for display & consistency
+    biz: {
+      mlBids: {},      // pid -> { amountUsd:null|number, committed:boolean }
+      move: {},        // pid -> { marketId:null|string, committed:boolean }
+      marketLocks: {}, // marketId -> pid|null
+      auction: {
+        entries: {},        // pid -> { bidUsd:null|number, committed, usedLobbyist, finalBidUsd, finalCommitted }
+        lobbyistPhaseActive: false,
+      }
+    },
+
+    crypto: {
+      rates: { BTC:8000, ETH:4000, LTC:2000, SIA:1000 },
+      ratesFrozen: true,
+      entries: {} // pid -> { deltas:{}, deltaUsd:number, committed:boolean }
+    },
+
+    settle: {
+      entries: {},  // pid -> { settlementUsd:number, committed:boolean, breakdown:[{label,usd}] }
+      effects: []   // applied expert effects for this year
+    }
+  };
+
+  // init reveal state
+  game.reveals[gm.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
+
+  games.set(gameId, game);
+  return { game, gm };
+}
+
+function gamePublic(game){
+  // for test we can ship a lot; reveals should be per-player (client will select)
+  return {
+    gameId: game.gameId,
+    status: game.status,
+    config: game.config,
+    year: game.year,
+    phase: game.phase,
+    bizStep: game.bizStep,
+    players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, marketId:p.marketId, wallet:p.wallet })),
+    trends: game.trends,
+    reveals: game.reveals,
+    lawyer: game.lawyer,
+    inventory: game.inventory,
+    available: {
+      investments: Array.from(game.availableCards.investments),
+      miningFarms: Array.from(game.availableCards.miningFarms),
+      experts: Array.from(game.availableCards.experts),
+    },
+    catalog: {
+      markets: CATALOG.markets,
+    },
+    biz: game.biz,
+    crypto: game.crypto,
+    settle: game.settle
+  };
+}
+
+function broadcast(game){
+  io.to(`game:${game.gameId}`).emit("game_state", gamePublic(game));
+}
+
+function ackOk(cb, payload){ if(typeof cb==="function") cb({ ok:true, ...(payload||{}) }); }
+function ackErr(cb, error, code){ if(typeof cb==="function") cb({ ok:false, error, code }); }
+
+function getGame(gameId){
+  const g = games.get(gameId);
+  return g || null;
+}
+function getPlayer(game, playerId){
+  return game.players.find(p=>p.playerId===playerId) || null;
+}
+function isGM(game, playerId){
+  const p = getPlayer(game, playerId);
+  return p && p.role==="GM";
+}
+
+function currentYearCrypto(game){
+  const y = game.year || 1;
+  return (game.trends?.byYear?.[String(y)]?.crypto) || null;
+}
+
+function currentYearGlobals(game){
+  const y = game.year || 1;
+  return (game.trends?.byYear?.[String(y)]?.globals) || [];
+}
+
+function ensureLawyerStore(game, playerId){
+  if(!game.lawyer) game.lawyer = { protections:{}, notices:{} };
+  if(!game.lawyer.protections[playerId]) game.lawyer.protections[playerId] = {};
+  if(!game.lawyer.protections[playerId][String(game.year||1)]) game.lawyer.protections[playerId][String(game.year||1)] = {};
+  if(!game.lawyer.notices[playerId]) game.lawyer.notices[playerId] = [];
+}
+
+function isProtectedFrom(game, playerId, trendKey){
+  const y = String(game.year||1);
+  return !!game.lawyer?.protections?.[playerId]?.[y]?.[trendKey];
+}
+
+function addNotice(game, playerId, trendKey, message){
+  ensureLawyerStore(game, playerId);
+  game.lawyer.notices[playerId].push({ year: game.year||1, trendKey, message, ts: now() });
+}
+
+function canUseLawyerNow(game, trend){
+  const phase = game.phase;
+  const biz = game.bizStep;
+  const req = trend?.lawyer?.phase;
+  if(!trend?.lawyer?.allowed) return false;
+  if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="TRENDS";
+  if(req==="BIZ_MOVE_ONLY") return phase==="BIZ" && biz==="MOVE";
+  if(req==="AUDIT_ANYTIME_BEFORE_CLOSE") return phase==="SETTLE";
+  return false;
+}
+
+function applyTrendTriggers_OnTrendsToML(game){
+  const globals = currentYearGlobals(game);
+  const cryptoTrend = currentYearCrypto(game);
+  const has = (k)=> globals.some(t=>t.key===k);
+
+  // Apply crypto trend coefficients to exchange rates at the moment new trends activate for the year
+  if(cryptoTrend && cryptoTrend.coeff){
+    for(const sym of ["BTC","ETH","LTC","SIA"]){
+      const coef = Number(cryptoTrend.coeff[sym] ?? 1);
+      const prev = Number(game.crypto?.rates?.[sym] ?? 1);
+      const next = Math.max(1, prev * coef);
+      game.crypto.rates[sym] = next;
     }
   }
-  setStep(game, 3, "F3_CLOSE"); game.fsm.phase=3; game.stepData.close={}; startTimer(game, defaultClockSeconds()); broadcast(game);
-}
 
-function computeSettlement(game, playerId){
-  const p = game.players.find(x=>x.playerId===playerId);
-  const ownedInv = game.assets.filter(a=>a.type==="TRADITIONAL_INVESTMENT" && a.owner?.playerId===playerId);
-  const farms = game.assets.filter(a=>a.type==="MINING_FARM" && a.owner?.playerId===playerId);
-  const yearObj = game.seed.years.find(y=>y.year===game.fsm.year);
-  let base = ownedInv.reduce((s,a)=>s + Number(a.rules.usdProduction||0), 0);
-  let global = 0; let regional = 0;
-  let electricity = farms.reduce((s,a)=> s + Number(a.rules.electricityUSD||0) * Number(a.owner.quantity||1), 0);
-  let elecMult = 1.0;
-  for(const t of yearObj.globals){
-    const eff=t.effect;
-    if(eff.type==="ALL_USD_BONUS") global += Number(eff.params.usd||0);
-    if(eff.type==="ALL_USD_PENALTY") global += Number(eff.params.usd||0);
-    if(eff.type==="ELECTRICITY_MULT") elecMult *= Number(eff.params.mult||1);
+  // For each player apply in this exact order:
+  // 1) Exchange hack (halve all) – negative, lawyer can protect
+  // 2) Forks – positive
+  // 3) Hyperinflation – not applied by app, only notice if protected
+  for(const p of game.players){
+    const pid = p.playerId;
+
+    if(has("EXCHANGE_HACK") && !isProtectedFrom(game, pid, "EXCHANGE_HACK")){
+      for(const sym of ["BTC","ETH","LTC","SIA"]){
+        const v = Math.floor(Number(p.wallet?.crypto?.[sym]||0) / 2);
+        p.wallet.crypto[sym] = v;
+      }
+    } else if(has("EXCHANGE_HACK") && isProtectedFrom(game, pid, "EXCHANGE_HACK")){
+      addNotice(game, pid, "EXCHANGE_HACK", "Ochráněno právníkem před hackerským útokem na kryptoburzu (krypto zůstatky se nesnížily).");
+    }
+
+    if(has("FORK_BTC_ETH")){
+      p.wallet.crypto.BTC = Number(p.wallet.crypto.BTC||0) * 2;
+      p.wallet.crypto.ETH = Number(p.wallet.crypto.ETH||0) * 2;
+    }
+    if(has("FORK_LTC_SIA")){
+      p.wallet.crypto.LTC = Number(p.wallet.crypto.LTC||0) * 2;
+      p.wallet.crypto.SIA = Number(p.wallet.crypto.SIA||0) * 2;
+    }
+
+    if(has("HYPERINFLATION_USD_HALVE") && isProtectedFrom(game, pid, "HYPERINFLATION_USD_HALVE")){
+      addNotice(game, pid, "HYPERINFLATION_USD_HALVE", "Ochráněno právníkem před Hyperinflací (tento hráč si NEodečítá 1/2 USD).");
+    }
   }
-  electricity = Math.round(electricity * elecMult);
-  const r = yearObj.regionals.find(x=>x.region===p.market?.continent);
-  if(r){ regional += Number(r.effect.params.usd||0); }
-  const total = base + global + regional - electricity;
-  const cryptoValue = Object.keys(game.prices).reduce((s,k)=> s + (p.wallet[k]||0)*game.prices[k], 0);
-  return { baseUSD: base, globalUSD: global, regionalUSD: regional, electricityUSD: electricity, totalUSD: total, cryptoValueUSD: cryptoValue, prices: game.prices };
 }
 
-function resolveSettlement(game){
-  game.stepData.settlement = {};
-  for(const p of game.players){ game.stepData.settlement[p.playerId] = computeSettlement(game, p.playerId); }
-  setStep(game, 3, "F3_RESULT"); broadcast(game);
-  if(game.fsm.year >= game.config.yearsTotal){ game.status="ENDED"; game.fsm.step="ENDED"; broadcast(game); return; }
-  game.fsm.year += 1; game.fsm.phase=1; setStep(game, 1, "F1_ML_BID"); game.stepData.mlBids={}; startTimer(game, defaultClockSeconds()); broadcast(game);
+function resetStepData(game){
+  game.biz.mlBids = {};
+  game.biz.move = {};
+  game.biz.auction = { entries:{}, lobbyistPhaseActive:false };
+  game.settle.effects = [];
+  game.settle.entries = {};
+  game.crypto.entries = {};
+  // market locks persist within year, but we rebuild for move step
+  game.biz.marketLocks = Object.fromEntries(CATALOG.markets.map(m=>[m.marketId, null]));
 }
 
-io.on("connection", (socket)=>{
+function startNewYear(game){
+  game.year += 1;
+  game.phase = "BIZ";
+  game.bizStep = "TRENDS";
+  resetStepData(game);
 
-  socket.on("create_game", (payload, cb)=>{
+  // initialize per-player step objects
+  for(const p of game.players){
+    if(!game.reveals[p.playerId]) game.reveals[p.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
+    if(!game.inventory[p.playerId]) game.inventory[p.playerId] = blankInventory();
+  }
+}
+
+function calcSettlementFor(game, playerId){
+  // Deterministic settlement (test):
+  // - base USD from investments (may be modified by global trends at AUDIT)
+  // - electricity costs from mining farms (may be modified by global trends)
+  // - expert effects (steal base production)
+
+  const inv = game.inventory[playerId] || blankInventory();
+
+  const y = game.year || 1;
+  const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+
+  const protectedMap = (game.lawyer?.protections?.[playerId]?.[String(y)]) || {};
+  const protectedSet = new Set(Object.keys(protectedMap));
+  const hasTrend = (key)=> globals.some(t=>t.key===key);
+  const isProtected = (key)=> protectedSet.has(key);
+
+  // Base production
+  let base = inv.investments.reduce((s,c)=>s + Number(c.usdProduction||0), 0);
+
+  // Global trend modifiers for AUDIT (only if trend applies and player not protected)
+  if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isProtected("ECONOMIC_CRISIS_NO_TRAD_BASE")) base = 0;
+  if(hasTrend("TRAD_INV_DOUBLE_USD")) base = base * 2; // positive trend (no lawyer)
+
+  // Electricity costs
+  let electricity = inv.miningFarms.reduce((s,c)=>s + Number(c.electricityUSD||0), 0);
+  if(hasTrend("EXPENSIVE_ELECTRICITY") && !isProtected("EXPENSIVE_ELECTRICITY")) electricity = electricity * 2;
+
+  // Build breakdown
+  const breakdown = [];
+  breakdown.push({ label:"Základní produkce (investice)", usd: base });
+  if(electricity){ breakdown.push({ label:"Elektřina (mining)", usd: -electricity }); }
+
+  // Expert effects (steal base prod)
+  let effectsDelta = 0;
+  for(const e of (game.settle.effects||[])){
+    if(e.type==="STEAL_BASE_PRODUCTION"){
+      if(e.toPlayerId===playerId){
+        effectsDelta += e.usd;
+        breakdown.push({ label:`Krádež produkce (${e.cardId})`, usd: +e.usd });
+      }
+      if(e.fromPlayerId===playerId){
+        effectsDelta -= e.usd;
+        breakdown.push({ label:`Ztráta produkce (${e.cardId})`, usd: -e.usd });
+      }
+    }
+  }
+
+  const settlementUsd = base - electricity + effectsDelta;
+  return { settlementUsd, breakdown };
+}
+
+
+function canBack(game){
+  // Guard: can back only if current step has no commits (for its relevant step)
+  if(game.status!=="IN_PROGRESS") return false;
+
+  if(game.phase==="BIZ"){
+    if(game.bizStep==="TRENDS") return true; // can go back to previous phase? handled separately; allow for now
+    if(game.bizStep==="ML_BID"){
+      return !Object.values(game.biz.mlBids).some(v=>v?.committed);
+    }
+    if(game.bizStep==="MOVE"){
+      return !Object.values(game.biz.move).some(v=>v?.committed);
+    }
+    if(game.bizStep==="AUCTION_ENVELOPE"){
+      return !Object.values(game.biz.auction.entries).some(v=>v?.committed || v?.finalCommitted);
+    }
+  }
+  if(game.phase==="CRYPTO"){
+    return !Object.values(game.crypto.entries).some(v=>v?.committed);
+  }
+  if(game.phase==="SETTLE"){
+    return !Object.values(game.settle.entries).some(v=>v?.committed);
+  }
+  return false;
+}
+
+function gmNext(game){
+  if(game.phase==="BIZ"){
+    if(game.bizStep==="TRENDS"){ applyTrendTriggers_OnTrendsToML(game); game.bizStep="ML_BID"; return; }
+    if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
+    if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
+    if(game.bizStep==="AUCTION_ENVELOPE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
+  } else if(game.phase==="CRYPTO"){
+    game.phase="SETTLE"; return;
+  } else if(game.phase==="SETTLE"){
+    // End of year; monopoly check occurs here at start of new year (per rules) – we expose hook.
+    if(game.year >= game.config.yearsTotal){
+      game.status="GAME_OVER";
+      game.phase=null; game.bizStep=null;
+      return;
+    }
+    startNewYear(game);
+    return;
+  }
+}
+
+function gmBack(game){
+  if(game.phase==="BIZ"){
+    if(game.bizStep==="ML_BID"){ game.bizStep="TRENDS"; return; }
+    if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
+    if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; return; }
+  } else if(game.phase==="CRYPTO"){
+    game.phase="BIZ"; game.bizStep="AUCTION_ENVELOPE"; return;
+  } else if(game.phase==="SETTLE"){
+    game.phase="CRYPTO"; return;
+  }
+}
+
+/* Socket handlers */
+io.on("connection", (socket) => {
+  socket.on("create_game", (payload, cb) => {
     try{
-      const gameId = shortId();
-      const maxPlayers = clampPlayers(payload?.maxPlayers);
-      const yearsTotal = clampYears(payload?.yearsTotal);
-      const title = String(payload?.title || "Kryptopoly").slice(0,60);
-
-      const gm = { playerId: uuidv4(), name: String(payload?.gmName||"GM").slice(0,24), role:"GM", market:{continent:null, marketId:null}, wallet:{BTC:0,ETH:0,LTC:0,SIA:0} };
-
-      const game = {
-        gameId,
-        config: { title, maxPlayers, yearsTotal, createdAt: now() },
-        status: "LOBBY",
-        seed: generateSeed(yearsTotal),
-        players: [gm],
-        assets: [],
-        prices: initialPrices(),
-        fsm: { year: 1, phase: 1, step:"LOBBY", stepStartedAt: now(), timerEndsAt: null },
-        stepData: {},
-        meta: { currentML: null, deckInvestments: shuffle(CATALOG.investments) }
-      };
-
-      games.set(gameId, game);
-      cb && cb({ ok:true, gameId, gmPlayerId: gm.playerId });
-      io.to(`lobby:${gameId}`).emit("lobby_update", { gameId, config: game.config, players: game.players });
-    }catch(e){ cb && cb({ ok:false, error: String(e?.message||e) }); }
+      const { name, yearsTotal, maxPlayers } = payload || {};
+      const { game, gm } = newGame({ gmName:name, yearsTotal, maxPlayers });
+      ackOk(cb, { gameId: game.gameId, playerId: gm.playerId, role: gm.role });
+      io.to(socket.id).emit("created_game", { gameId: game.gameId, playerId: gm.playerId });
+    }catch(e){
+      ackErr(cb, "create_game failed");
+    }
   });
 
-  socket.on("join_game", ({ gameId, name }, cb)=>{
-    const game = games.get(gameId);
-    if(!game) return cb && cb({ ok:false, error:"Hra nenalezena." });
-    if(game.status!=="LOBBY") return cb && cb({ ok:false, error:"Hra už běží." });
-    if(game.players.length >= game.config.maxPlayers) return cb && cb({ ok:false, error:"Hra je plná." });
-    const clean = String(name||"").trim().slice(0,24);
-    if(!clean) return cb && cb({ ok:false, error:"Zadej jméno." });
-    if(game.players.some(p=>p.name.toLowerCase()===clean.toLowerCase())) return cb && cb({ ok:false, error:"Jméno už existuje." });
-    const p = { playerId: uuidv4(), name: clean, role:"PLAYER", market:{continent:null, marketId:null}, wallet:{BTC:0,ETH:0,LTC:0,SIA:0} };
+  socket.on("join_game", (payload, cb) => {
+    const { gameId, name } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.status!=="LOBBY" && game.status!=="IN_PROGRESS") return ackErr(cb, "Game closed", "CLOSED");
+    if(game.players.length >= game.config.maxPlayers) return ackErr(cb, "Game full", "FULL");
+
+    const p = makePlayer(name, "PLAYER");
     game.players.push(p);
-    cb && cb({ ok:true, playerId: p.playerId });
-    io.to(`lobby:${gameId}`).emit("lobby_update", { gameId, config: game.config, players: game.players });
-  });
+    game.inventory[p.playerId] = blankInventory();
+    game.reveals[p.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
 
-  socket.on("watch_lobby", ({ gameId }, cb)=>{
-    const game = games.get(gameId);
-    if(!game) return cb && cb({ ok:false, error:"Lobby nenalezeno." });
-    socket.join(`lobby:${gameId}`);
-    cb && cb({ ok:true });
-    socket.emit("lobby_update", { gameId, config: game.config, players: game.players });
-  });
-
-  socket.on("watch_game", ({ gameId }, cb)=>{
-    const game = games.get(gameId);
-    if(!game) return cb && cb({ ok:false, error:"Hra nenalezena." });
-    socket.join(`game:${gameId}`);
-    cb && cb({ ok:true });
-    socket.emit("game_state", publicGameState(game));
-  });
-
-  socket.on("start_game", ({ gameId }, cb)=>{
-    const game = games.get(gameId);
-    if(!game) return cb && cb({ ok:false, error:"Hra nenalezena." });
-    game.status="RUNNING";
-    game.fsm.year=1; game.fsm.phase=1;
-    setStep(game, 1, "F1_ML_BID");
-    game.stepData.mlBids={};
-    startTimer(game, defaultClockSeconds());
-    cb && cb({ ok:true });
-    io.to(`lobby:${gameId}`).emit("game_started", { gameId });
+    ackOk(cb, { playerId: p.playerId });
     broadcast(game);
   });
 
-  socket.on("tick", ({ gameId })=>{
-    const game = games.get(gameId);
-    if(!game || game.status!=="RUNNING") return;
-    resolveTimer(game);
+  socket.on("watch_lobby", (payload, cb) => {
+    const { gameId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    socket.join(`game:${gameId}`);
+    ackOk(cb);
+    // lobby_update for compatibility
+    io.to(socket.id).emit("lobby_update", {
+      gameId,
+      config: game.config,
+      players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role: p.role==="GM"?"GM":"PLAYER" }))
+    });
+    io.to(socket.id).emit("game_state", gamePublic(game));
   });
 
-  socket.on("submit_action", ({ gameId, playerId, actionType, data }, cb)=>{
-    const game = games.get(gameId);
-    if(!game) return cb && cb({ ok:false, error:"Hra nenalezena." });
-    const p = game.players.find(x=>x.playerId===playerId);
-    if(!p) return cb && cb({ ok:false, error:"Hráč nenalezen." });
-    const step = game.fsm.step;
+  socket.on("watch_game", (payload, cb) => {
+    const { gameId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    socket.join(`game:${gameId}`);
+    ackOk(cb);
+    io.to(socket.id).emit("game_state", gamePublic(game));
+  });
 
+  socket.on("start_game", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    // allow GM start even without playerId for compatibility
+    if(playerId && !isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
+    if(game.status!=="LOBBY") return ackErr(cb, "Already started", "BAD_STATE");
+
+    game.status="IN_PROGRESS";
+    game.trends = generateTrends(game.config.yearsTotal);
+    game.year = 0;
+    startNewYear(game);
+
+    ackOk(cb);
+    io.to(`game:${gameId}`).emit("game_started", { gameId });
+    broadcast(game);
+  });
+
+  socket.on("gm_next", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
+    gmNext(game);
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  socket.on("gm_back", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
+    if(!canBack(game)) return ackErr(cb, "Nelze vrátit – už proběhly volby.", "GUARD_FAIL");
+    gmBack(game);
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Trends reveal (per-player, private but stored on server)
+  socket.on("reveal_global_next_year", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.status!=="IN_PROGRESS") return ackErr(cb, "Bad state", "BAD_STATE");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const hasAnalyst = inv.experts.some(e=>e.functionKey==="ANALYST" && !e.used);
+    if(!hasAnalyst) return ackErr(cb, "Nemáš Analytika.", "NO_POWER");
+
+    const currentYear = game.year;
+    const revealed = new Set(game.reveals[playerId]?.globalYearsRevealed || []);
+    let target = null;
+    for(let y=currentYear+1; y<=game.config.yearsTotal; y++){
+      if(!revealed.has(y)){ target = y; break; }
+    }
+    if(!target) return ackErr(cb, "Není co odkrývat.", "NO_TARGET");
+
+    // consume 1 analyst
+    const ex = inv.experts.find(e=>e.functionKey==="ANALYST" && !e.used);
+    ex.used = true;
+
+    game.reveals[playerId].globalYearsRevealed.push(target);
+    ackOk(cb, { year: target });
+    broadcast(game);
+  });
+
+  socket.on("reveal_crypto_next_year", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.status!=="IN_PROGRESS") return ackErr(cb, "Bad state", "BAD_STATE");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const has = inv.experts.some(e=>e.functionKey==="CRYPTOGURU" && !e.used);
+    if(!has) return ackErr(cb, "Nemáš Kryptoguru.", "NO_POWER");
+
+    const currentYear = game.year;
+    const revealed = new Set(game.reveals[playerId]?.cryptoYearsRevealed || []);
+    let target = null;
+    for(let y=currentYear+1; y<=game.config.yearsTotal; y++){
+      if(!revealed.has(y)){ target = y; break; }
+    }
+    if(!target) return ackErr(cb, "Není co odkrývat.", "NO_TARGET");
+
+    const ex = inv.experts.find(e=>e.functionKey==="CRYPTOGURU" && !e.used);
+    ex.used = true;
+
+    game.reveals[playerId].cryptoYearsRevealed.push(target);
+    ackOk(cb, { year: target });
+    broadcast(game);
+  });
+
+
+  // Lawyer protection against a specific global trend (per-player, per-year)
+  socket.on("use_lawyer_on_trend", (payload, cb) => {
+    const { gameId, playerId, trendKey } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.status!=="IN_PROGRESS") return ackErr(cb, "Bad state", "BAD_STATE");
+
+    const y = String(game.year||1);
+    const globals = currentYearGlobals(game);
+    const trend = globals.find(t=>t.key===trendKey) || null;
+    if(!trend) return ackErr(cb, "Trend není aktivní v tomto roce.", "NOT_ACTIVE");
+
+    if(!trend.lawyer?.allowed) return ackErr(cb, "Na tento trend nelze použít Právníka.", "NO_LAWYER");
+    if(!canUseLawyerNow(game, trend)) return ackErr(cb, "Právníka nyní nelze použít (špatná fáze).", "BAD_TIME");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const ex = inv.experts.find(e=>e.functionKey==="LAWYER_TRENDS" && !e.used);
+    if(!ex) return ackErr(cb, "Právník není k dispozici.", "NO_POWER");
+
+    // consume lawyer
+    ex.used = true;
+
+    ensureLawyerStore(game, playerId);
+    game.lawyer.protections[playerId][y][trendKey] = true;
+
+    // Immediate on-screen notice (player can show others)
+    addNotice(game, playerId, trendKey, `Právník aktivován: ${trend.name}. Tento globální trend se na hráče v roce ${game.year||1} nevztahuje.`);
+
+    ackOk(cb, { trendKey });
+    broadcast(game);
+  });
+
+  // Commit ML bid (no winner resolution here)
+  socket.on("commit_ml_bid", (payload, cb) => {
+    const { gameId, playerId, amountUsd } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="BIZ" || game.bizStep!=="ML_BID") return ackErr(cb, "Not ML step", "BAD_STATE");
+
+    let val = amountUsd;
+    if(val===null) val=null;
+    else {
+      val = Number(val);
+      if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid amount", "BAD_INPUT");
+      val = Math.floor(val);
+    }
+    game.biz.mlBids[playerId] = { amountUsd: val, committed:true, ts: now() };
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Move selection (locks markets)
+  socket.on("pick_market", (payload, cb) => {
+    const { gameId, playerId, marketId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="BIZ" || game.bizStep!=="MOVE") return ackErr(cb, "Not MOVE step", "BAD_STATE");
+    if(game.biz.move[playerId]?.committed) return ackErr(cb, "Already moved", "ALREADY");
+
+    if(!(marketId in game.biz.marketLocks)) return ackErr(cb, "Unknown market", "BAD_INPUT");
+    if(game.biz.marketLocks[marketId] && game.biz.marketLocks[marketId]!==playerId) return ackErr(cb, "Locked", "LOCKED");
+
+    // release previous
+    const prev = getPlayer(game, playerId)?.marketId;
+    if(prev && prev in game.biz.marketLocks) game.biz.marketLocks[prev] = null;
+
+    game.biz.marketLocks[marketId] = playerId;
+    const p = getPlayer(game, playerId); if(p) p.marketId = marketId;
+    game.biz.move[playerId] = { marketId, committed:true, ts: now() };
+
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Auction (envelope) bid
+  socket.on("commit_auction_bid", (payload, cb) => {
+    const { gameId, playerId, bidUsd, usedLobbyist } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
+
+    let val = bidUsd;
+    if(val===null) val=null;
+    else {
+      val = Number(val);
+      if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid bid", "BAD_INPUT");
+      val = Math.floor(val);
+    }
+    game.biz.auction.entries[playerId] = {
+      bidUsd: val,
+      committed:true,
+      usedLobbyist: !!usedLobbyist,
+      finalBidUsd: null,
+      finalCommitted:false,
+      ts: now()
+    };
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  socket.on("gm_open_lobbyist_window", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
+    if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
+
+    // guard: all players committed AND someone used lobbyist
+    const entries = game.biz.auction.entries;
+    const allCommitted = game.players.every(p=>entries[p.playerId]?.committed);
+    if(!allCommitted) return ackErr(cb, "Nejdřív všichni odešlou obálku.", "GUARD_FAIL");
+    const anyLobby = Object.values(entries).some(v=>v?.usedLobbyist);
+    if(!anyLobby) return ackErr(cb, "Nikdo nepoužil lobbistu.", "GUARD_FAIL");
+
+    game.biz.auction.lobbyistPhaseActive = true;
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  socket.on("commit_auction_final_bid", (payload, cb) => {
+    const { gameId, playerId, finalBidUsd } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
+    if(!game.biz.auction.lobbyistPhaseActive) return ackErr(cb, "No lobbyist window", "BAD_STATE");
+
+    const entry = game.biz.auction.entries[playerId];
+    if(!entry?.usedLobbyist) return ackErr(cb, "Not a lobbyist user", "FORBIDDEN");
+
+    const val = Math.floor(Number(finalBidUsd));
+    if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid bid", "BAD_INPUT");
+
+    entry.finalBidUsd = val;
+    entry.finalCommitted = true;
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Scan cards
+  socket.on("scan_card", (payload, cb) => {
+    const { gameId, playerId, cardQr } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const id = String(cardQr||"").trim();
+    if(!id) return ackErr(cb, "Bad QR", "BAD_INPUT");
+
+    // find in catalog
+    const card = CATALOG.investments.find(c=>c.cardId===id)
+      || CATALOG.miningFarms.find(c=>c.cardId===id)
+      || CATALOG.experts.find(c=>c.cardId===id);
+    if(!card) return ackErr(cb, "Unknown card", "UNKNOWN");
+
+    // enforce availability sets
+    const sets = game.availableCards;
+    const set = card.kind==="INVESTMENT" ? sets.investments : card.kind==="MINING_FARM" ? sets.miningFarms : sets.experts;
+    if(!set.has(card.cardId)) return ackErr(cb, "Karta není v nabídce.", "NOT_AVAILABLE");
+
+    set.delete(card.cardId);
+    const inv = game.inventory[playerId] || blankInventory();
+    if(card.kind==="EXPERT"){
+      inv.experts.push({ ...card, used:false });
+    } else if(card.kind==="INVESTMENT"){
+      inv.investments.push({ ...card });
+    } else {
+      inv.miningFarms.push({ ...card });
+    }
+    game.inventory[playerId]=inv;
+
+    ackOk(cb, { card });
+    broadcast(game);
+  });
+
+  socket.on("drop_card", (payload, cb) => {
+    const { gameId, playerId, cardId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const id = String(cardId||"").trim();
+    if(!id) return ackErr(cb, "Bad cardId", "BAD_INPUT");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    let found = null;
+    for(const key of ["investments","miningFarms","experts"]){
+      const idx = inv[key].findIndex(c=>c.cardId===id);
+      if(idx>=0){ found = inv[key][idx]; inv[key].splice(idx,1); break; }
+    }
+    if(!found) return ackErr(cb, "Card not owned", "NOT_OWNED");
+
+    const sets = game.availableCards;
+    const set = found.kind==="INVESTMENT" ? sets.investments : found.kind==="MINING_FARM" ? sets.miningFarms : sets.experts;
+    set.add(found.cardId);
+
+    game.inventory[playerId]=inv;
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Crypto commit (server computes deltaUsd for display)
+  socket.on("commit_crypto", (payload, cb) => {
+    const { gameId, playerId, deltas } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="CRYPTO") return ackErr(cb, "Not CRYPTO phase", "BAD_STATE");
+
+    const clean = {};
+    let deltaUsd = 0;
+    for(const sym of ["BTC","ETH","LTC","SIA"]){
+      const d = Math.floor(Number(deltas?.[sym]||0));
+      if(!Number.isFinite(d)) return ackErr(cb, "Bad deltas", "BAD_INPUT");
+      clean[sym]=d;
+      deltaUsd += -d * Number(game.crypto.rates[sym]||0); // buying positive costs USD (negative delta), selling negative gives USD
+    }
+    game.crypto.entries[playerId] = { deltas: clean, deltaUsd, committed:true, ts: now() };
+    ackOk(cb, { deltaUsd });
+    broadcast(game);
+  });
+
+  // Apply expert effect (steal base production for this year)
+  socket.on("apply_expert_effect", (payload, cb) => {
+    const { gameId, playerId, effect } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+
+    const type = effect?.type;
+    if(type!=="STEAL_BASE_PRODUCTION") return ackErr(cb, "Unsupported effect", "BAD_INPUT");
+    const targetPlayerId = effect?.targetPlayerId;
+    const cardId = effect?.cardId;
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const has = inv.experts.some(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
+    if(!has) return ackErr(cb, "Nemáš lobbistu (krádež).", "NO_POWER");
+
+    // Card must belong to target (ownership does not change)
+    const targetInv = game.inventory[targetPlayerId] || blankInventory();
+    const card = targetInv.investments.find(c=>c.cardId===cardId);
+    if(!card) return ackErr(cb, "Cíl nevlastní tuto investici.", "BAD_INPUT");
+
+    const usd = Number(card.usdProduction||0);
+
+    // consume expert
+    const ex = inv.experts.find(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
+    ex.used=true;
+
+    game.settle.effects.push({ type:"STEAL_BASE_PRODUCTION", fromPlayerId: targetPlayerId, toPlayerId: playerId, cardId, usd });
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Settlement commit (server computes display settlement)
+  socket.on("commit_settlement_ready", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+
+    const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
+    game.settle.entries[playerId] = { settlementUsd, breakdown, committed:true, ts: now() };
+    ackOk(cb, { settlementUsd });
+    broadcast(game);
+  });
+
+  // Preview audit (no commit) – used by "Předběžný audit" in accounting.
+  socket.on("preview_audit", (payload, cb) => {
     try{
-      if(step==="F1_ML_BID" && actionType==="ML_BID"){
-        game.stepData.mlBids = game.stepData.mlBids || {};
-        const want = data?.want===true;
-        const bid = want ? Math.max(0, Number(data?.bid||0)) : null;
-        game.stepData.mlBids[playerId] = { bid, ts: now() };
-        if(Object.keys(game.stepData.mlBids).length === game.players.length) resolveML(game);
-        else broadcast(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F1_MOVE" && actionType==="MOVE_SELECT"){
-        game.stepData.moves = game.stepData.moves || {};
-        const marketId = String(data?.marketId||"").trim();
-        const continent = String(data?.continent||"EUROPE").trim();
-        const taken = new Set(Object.values(game.stepData.moves).map(v=>v.marketId).filter(Boolean));
-        if(taken.has(marketId) && game.stepData.moves[playerId]?.marketId !== marketId) return cb && cb({ ok:false, error:"Trh obsazen." });
-        game.stepData.moves[playerId] = { marketId, continent, ts: now() };
-        p.market = { marketId, continent };
-        if(Object.keys(game.stepData.moves).length === game.players.length) resolveMoves(game);
-        else broadcast(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F1_ENVELOPE" && actionType==="ENVELOPE_BID"){
-        game.stepData.envelope = game.stepData.envelope || {};
-        const want = data?.want===true;
-        const bid = want ? Math.max(0, Number(data?.bid||0)) : null;
-        const useLobby = data?.useLobby===true;
-        game.stepData.envelope[playerId] = { bid, usedLobby: useLobby, ts: now(), finalBid: null };
-        broadcast(game);
-        if(Object.keys(game.stepData.envelope).length === game.players.length){
-          const anyLobby = Object.values(game.stepData.envelope).some(v=>v.usedLobby);
-          if(anyLobby){
-            setStep(game, 1, "F1_LOBBY_LASTCALL");
-            game.stepData.lastCall = { pending: Object.fromEntries(Object.entries(game.stepData.envelope).filter(([_,v])=>v.usedLobby)) };
-            startTimer(game, 20);
-            broadcast(game);
-          } else { resolveEnvelope(game); }
-        }
-        return cb && cb({ ok:true });
-      }
-      if(step==="F1_LOBBY_LASTCALL" && actionType==="LOBBY_FINAL_BID"){
-        const entry = game.stepData.envelope?.[playerId];
-        if(!entry?.usedLobby) return cb && cb({ ok:false, error:"Lobbista není aktivní." });
-        entry.finalBid = Math.max(0, Number(data?.finalBid||0));
-        entry.ts = now();
-        broadcast(game);
-        const pending = Object.entries(game.stepData.envelope).filter(([_,v])=>v.usedLobby);
-        const allFinal = pending.every(([_,v])=>v.finalBid!=null);
-        if(allFinal) resolveEnvelope(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F1_SCAN" && actionType==="SCAN_CARD"){
-        const cardId = String(data?.cardId||"").trim();
-        if(!cardId) return cb && cb({ ok:false, error:"Chybí cardId." });
-        const inv = CATALOG.investments.find(x=>x.cardId===cardId);
-        const mf  = CATALOG.miningFarms.find(x=>x.cardId===cardId);
-        const ex  = CATALOG.experts.find(x=>x.cardId===cardId);
-        let type=null, card=null;
-        if(inv){ type="TRADITIONAL_INVESTMENT"; card=inv; }
-        else if(mf){ type="MINING_FARM"; card=mf; }
-        else if(ex){ type="EXPERT"; card=ex; }
-        else return cb && cb({ ok:false, error:"Neznámá karta." });
-
-        if(type!=="MINING_FARM"){
-          if(game.assets.some(a=>a.cardId===cardId)) return cb && cb({ ok:false, error:"Karta už je ve hře." });
-        }
-        if(type==="MINING_FARM"){
-          const existing = game.assets.find(a=>a.cardId===cardId && a.owner?.playerId===playerId);
-          if(existing) existing.owner.quantity += 1;
-          else game.assets.push({ assetId: uuidv4(), type, cardId, name: card.name, rules:{ electricityUSD: card.electricityUSD }, owner:{ playerId, quantity: 1 }});
-        }
-        if(type==="TRADITIONAL_INVESTMENT"){
-          game.assets.push({ assetId: uuidv4(), type, cardId, name: card.name, rules:{ usdProduction: card.usdProduction, type: card.type }, owner:{ playerId, quantity: 1 }});
-        }
-        if(type==="EXPERT"){
-          game.assets.push({ assetId: uuidv4(), type, cardId, name: card.name, rules:{ function: card.function, functionLabel: card.functionLabel }, owner:{ playerId, quantity: 1 }});
-        }
-        broadcast(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F1_SCAN" && actionType==="NEXT_PHASE"){
-        if(p.role!=="GM") return cb && cb({ ok:false, error:"Pouze GM." });
-        setStep(game, 2, "F2_CRYPTO");
-        game.fsm.phase = 2;
-        game.stepData.crypto = {};
-        startTimer(game, defaultClockSeconds());
-        broadcast(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F2_CRYPTO" && actionType==="CRYPTO_SET"){
-        game.stepData.crypto = game.stepData.crypto || {};
-        const sym = String(data?.sym||"");
-        const delta = Number(data?.delta||0);
-        if(!["BTC","ETH","LTC","SIA"].includes(sym)) return cb && cb({ ok:false, error:"Neznámé krypto." });
-        const entry = game.stepData.crypto[playerId] || { trades:{}, confirm:false, ts: now() };
-        entry.trades[sym] = Math.max(-10, Math.min(10, delta));
-        entry.ts = now();
-        game.stepData.crypto[playerId] = entry;
-        broadcast(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F2_CRYPTO" && actionType==="CRYPTO_CONFIRM"){
-        game.stepData.crypto = game.stepData.crypto || {};
-        const entry = game.stepData.crypto[playerId] || { trades:{}, confirm:false, ts: now() };
-        entry.confirm = true;
-        entry.ts = now();
-        game.stepData.crypto[playerId] = entry;
-        broadcast(game);
-        const all = game.players.every(pp=> game.stepData.crypto?.[pp.playerId]?.confirm===true);
-        if(all) resolveCrypto(game);
-        return cb && cb({ ok:true });
-      }
-      if(step==="F3_CLOSE" && actionType==="F3_SUBMIT"){
-        game.stepData.close = game.stepData.close || {};
-        game.stepData.close[playerId] = { confirm: true, ts: now() };
-        broadcast(game);
-        const all = game.players.every(pp=> game.stepData.close?.[pp.playerId]?.confirm===true);
-        if(all) resolveSettlement(game);
-        return cb && cb({ ok:true });
-      }
-      return cb && cb({ ok:false, error:"Akce není dostupná v tomto kroku." });
-    }catch(e){ return cb && cb({ ok:false, error:String(e?.message||e) }); }
+      const { gameId, playerId } = payload || {};
+      const game = games.get(gameId);
+      if(!game) return ackErr(cb, "Hra neexistuje.");
+      const p = game.players.find(x=>x.playerId===playerId);
+      if(!p) return ackErr(cb, "Neplatný hráč.");
+      const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
+      return ackOk(cb, { settlementUsd, breakdown });
+    }catch(e){
+      return ackErr(cb, "Chyba preview auditu.");
+    }
   });
-
 });
 
-setInterval(()=>{ for(const g of games.values()){ if(g.status==="RUNNING") resolveTimer(g); } }, 500);
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, ()=> console.log("Kryptopoly server listening on", PORT));
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => console.log("Server listening on", PORT));

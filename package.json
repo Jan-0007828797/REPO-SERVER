@@ -1,6 +1,6 @@
 {
-  "name": "kryptopoly-server",
-  "version": "2.5.0",
+  "name": "kryptopoly-server-v3_2",
+  "version": "3.2.0",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {

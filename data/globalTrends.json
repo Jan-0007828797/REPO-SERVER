@@ -1,0 +1,162 @@
+[
+  {
+    "id": 1,
+    "key": "EXPENSIVE_ELECTRICITY",
+    "name": "Drahá elektřina",
+    "icon": "⚡",
+    "desc": "Při Auditu jsou poplatky za elektřinu dvounásobné.",
+    "appEffect": "AUDIT: cena USD za elektřinu ×2 (Mining farmy).",
+    "trigger": "AUDIT_CLOSE",
+    "lawyer": { "allowed": true, "phase": "AUDIT_ANYTIME_BEFORE_CLOSE" }
+  },
+  {
+    "id": 2,
+    "key": "EXCHANGE_HACK",
+    "name": "Hackerský útok na kryptoburzu",
+    "icon": "🧑‍💻",
+    "desc": "Hráči přijdou okamžitě o polovinu ks všech svých kryptoměn.",
+    "appEffect": "Při posunu GM z Trendy → Market Leader: všechny krypto zůstatky hráčů se sníží na polovinu (floor).",
+    "trigger": "BIZ_TRENDS_TO_ML",
+    "lawyer": { "allowed": true, "phase": "BIZ_TRENDS_ONLY" }
+  },
+  {
+    "id": 3,
+    "key": "LOWER_DIFFICULTY",
+    "name": "Nižší difficulty",
+    "icon": "⛏️",
+    "desc": "Při Auditu Mining farmy generují dvakrát tolik jednotek kryptoměn.",
+    "appEffect": "AUDIT: produkce Mining farem (ks) ×2.",
+    "trigger": "AUDIT_CLOSE",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 4,
+    "key": "BANK_CRISIS_NO_INDUSTRY_AUCTION",
+    "name": "Bankovní krize",
+    "icon": "🏦",
+    "desc": "V Byznysové fázi hráči nemohou přidat do dražební položky Tradiční investici Průmysl.",
+    "appEffect": "Nemá vliv na Aplikaci (pravidlo pro herní plán).",
+    "trigger": "NONE",
+    "lawyer": { "allowed": true, "phase": "BIZ_MOVE_ONLY" }
+  },
+  {
+    "id": 5,
+    "key": "FOOD_CRISIS_NO_AGRO_AUCTION",
+    "name": "Potravinová krize",
+    "icon": "🌾",
+    "desc": "V Byznysové fázi hráči nemohou přidat do dražební položky Tradiční investici Zemědělství.",
+    "appEffect": "Nemá vliv na Aplikaci (pravidlo pro herní plán).",
+    "trigger": "NONE",
+    "lawyer": { "allowed": true, "phase": "BIZ_MOVE_ONLY" }
+  },
+  {
+    "id": 6,
+    "key": "COMMODITY_CRISIS_NO_MINING_AUCTION",
+    "name": "Surovinová krize",
+    "icon": "🪨",
+    "desc": "V Byznysové fázi hráči nemohou přidat do dražební položky Tradiční investici Těžba.",
+    "appEffect": "Nemá vliv na Aplikaci (pravidlo pro herní plán).",
+    "trigger": "NONE",
+    "lawyer": { "allowed": true, "phase": "BIZ_MOVE_ONLY" }
+  },
+  {
+    "id": 7,
+    "key": "TRAD_INV_DOUBLE_USD",
+    "name": "Mimořádné zisky Tradičních investic",
+    "icon": "💰",
+    "desc": "Při Auditu je základní produkce USD všech Tradičních investic dvounásobná.",
+    "appEffect": "AUDIT: základní produkce USD všech Tradičních investic ×2.",
+    "trigger": "AUDIT_CLOSE",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 8,
+    "key": "ANTIMONOPOLY_NO_BONUSES",
+    "name": "Antimonopolní úřad",
+    "icon": "⚖️",
+    "desc": "Při Auditu Globální ani Regionální bonusy jsou nulové. Tradiční investice generují pouze základní produkce USD.",
+    "appEffect": "AUDIT: globální + regionální bonusy = 0.",
+    "trigger": "AUDIT_CLOSE",
+    "lawyer": { "allowed": true, "phase": "AUDIT_ANYTIME_BEFORE_CLOSE" }
+  },
+  {
+    "id": 9,
+    "key": "HIGH_EXPECTATIONS_MIN_BID_BY_PRICE_LEVEL",
+    "name": "Vysoká očekávání",
+    "icon": "📊",
+    "desc": "V Aukci lze přihodit minimálně základní cenu dle aktuální cenové hladiny (Rok 1: 5 000; Rok 2: 10 000; Rok 3: 15 000; Rok 4: 20 000; Rok 5: 25 000 USD).",
+    "appEffect": "Nemá vliv na Aplikaci (pravidlo pro herní plán).",
+    "trigger": "NONE",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 10,
+    "key": "JUST_IN_TIME",
+    "name": "Just-in-time delivery",
+    "icon": "⏱️",
+    "desc": "Kratší čas na podání všech nabídek, dokončení kryptotransakce nebo uzavření Auditu.",
+    "appEffect": "Časovač defaultně 60s → zkrácen na 30s pro: ML nabídka, MOVE, Obálka, Krypto, Audit potvrzení.",
+    "trigger": "ON_TIMER_START",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 11,
+    "key": "ECONOMIC_CRISIS_NO_TRAD_BASE",
+    "name": "Hospodářská krize",
+    "icon": "📉",
+    "desc": "Při Auditu Tradiční investice neprodukují základní produkci USD; bonusy tím nejsou ovlivněny.",
+    "appEffect": "AUDIT: základní produkce USD všech Tradičních investic = 0.",
+    "trigger": "AUDIT_CLOSE",
+    "lawyer": { "allowed": true, "phase": "AUDIT_ANYTIME_BEFORE_CLOSE" }
+  },
+  {
+    "id": 12,
+    "key": "FORK_BTC_ETH",
+    "name": "Fork BTC a ETH",
+    "icon": "🪙",
+    "desc": "Zůstatky BTC a ETH se zdvounásobí okamžitě.",
+    "appEffect": "Při posunu GM z Trendy → Market Leader: BTC a ETH zůstatky ×2.",
+    "trigger": "BIZ_TRENDS_TO_ML",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 13,
+    "key": "FORK_LTC_SIA",
+    "name": "Fork LTC a SIA",
+    "icon": "🪙",
+    "desc": "Zůstatky LTC a SIA se zdvounásobí okamžitě.",
+    "appEffect": "Při posunu GM z Trendy → Market Leader: LTC a SIA zůstatky ×2.",
+    "trigger": "BIZ_TRENDS_TO_ML",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 14,
+    "key": "BOOM_DOUBLE_MIN_AUCTION_PRICE",
+    "name": "Konjunktura",
+    "icon": "🔥",
+    "desc": "Při Dražbě lze získat položky za dvounásobek běžné vyvolávací ceny (5 000; 10 000; 15 000; 20 000; 25 000 USD).",
+    "appEffect": "Nemá vliv na Aplikaci (pravidlo pro herní plán).",
+    "trigger": "NONE",
+    "lawyer": { "allowed": false, "phase": "NEVER" }
+  },
+  {
+    "id": 15,
+    "key": "PANDEMIC_CONTINENT_LOCK",
+    "name": "Pandemie",
+    "icon": "🦠",
+    "desc": "Hráči se nemohou přesunout na jiné kontinenty ani na ně vstoupit.",
+    "appEffect": "MOVE: hráči vidí jen trhy na svém kontinentu. Právník v MOVE odemkne výběr mimo kontinent.",
+    "trigger": "BIZ_MOVE",
+    "lawyer": { "allowed": true, "phase": "BIZ_MOVE_ONLY" }
+  },
+  {
+    "id": 16,
+    "key": "HYPERINFLATION_USD_HALVE",
+    "name": "Hyperinflace",
+    "icon": "💸",
+    "desc": "Hráči přijdou okamžitě o polovinu ks všech svých USD.",
+    "appEffect": "Nemá vliv na Aplikaci (hráči kontrolují sami) – aplikace ale umí zobrazit oznámení o ochraně právníkem.",
+    "trigger": "BIZ_TRENDS_TO_ML",
+    "lawyer": { "allowed": true, "phase": "BIZ_TRENDS_ONLY" }
+  }
+]
