@@ -332,7 +332,7 @@ function canUseLawyerNow(game, trend){
   const biz = game.bizStep;
   const req = trend?.lawyer?.phase;
   if(!trend?.lawyer?.allowed) return false;
-  if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="TRENDS";
+  if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="ML_BID";
   if(req==="BIZ_MOVE_ONLY") return phase==="BIZ" && biz==="MOVE";
   if(req==="AUDIT_ANYTIME_BEFORE_CLOSE") return phase==="SETTLE";
   return false;
@@ -398,7 +398,8 @@ function resetStepData(game){
 function startNewYear(game){
   game.year += 1;
   game.phase = "BIZ";
-  game.bizStep = "TRENDS";
+  // Subfáze Trendy je odstraněna: první subfází je vždy ML.
+  game.bizStep = "ML_BID";
   resetStepData(game);
 
   // initialize per-player step objects
@@ -406,7 +407,11 @@ function startNewYear(game){
     if(!game.reveals[p.playerId]) game.reveals[p.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
     if(!game.inventory[p.playerId]) game.inventory[p.playerId] = blankInventory();
   }
+
+  // Trendy se aktivují na začátku roku (dříve při přechodu TRENDS -> ML).
+  applyTrendTriggers_OnTrendsToML(game);
 }
+
 
 function calcSettlementFor(game, playerId){
   // Deterministic settlement (test):
@@ -465,7 +470,6 @@ function canBack(game){
   if(game.status!=="IN_PROGRESS") return false;
 
   if(game.phase==="BIZ"){
-    if(game.bizStep==="TRENDS") return true; // can go back to previous phase? handled separately; allow for now
     if(game.bizStep==="ML_BID"){
       return !Object.values(game.biz.mlBids).some(v=>v?.committed);
     }
@@ -485,11 +489,9 @@ function canBack(game){
   return false;
 }
 
+
 function gmNext(game){
-  if(game.phase==="BIZ"){
-    if(game.bizStep==="TRENDS"){ applyTrendTriggers_OnTrendsToML(game); game.bizStep="ML_BID"; return; }
-    if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
-    if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
+  if(game.phase==="BIZ"){    if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="SETTLE"; return;
@@ -506,9 +508,7 @@ function gmNext(game){
 }
 
 function gmBack(game){
-  if(game.phase==="BIZ"){
-    if(game.bizStep==="ML_BID"){ game.bizStep="TRENDS"; return; }
-    if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
+  if(game.phase==="BIZ"){    if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="BIZ"; game.bizStep="AUCTION_ENVELOPE"; return;
@@ -703,6 +703,9 @@ io.on("connection", (socket) => {
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
     if(game.phase!=="BIZ" || game.bizStep!=="ML_BID") return ackErr(cb, "Not ML step", "BAD_STATE");
 
+    // Definitivní rozhodnutí: po potvrzení už nelze změnit částku ani volbu.
+    if(game.biz.mlBids[playerId]?.committed) return ackErr(cb, "Already committed", "ALREADY");
+
     let val = amountUsd;
     if(val===null) val=null;
     else {
@@ -710,11 +713,25 @@ io.on("connection", (socket) => {
       if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid amount", "BAD_INPUT");
       val = Math.floor(val);
     }
+
     game.biz.mlBids[playerId] = { amountUsd: val, committed:true, ts: now() };
     ackOk(cb);
-    broadcast(game);
-  });
 
+    broadcast(game);
+
+    // GM CTA: jakmile všichni hráči definitivně potvrdí ML obálku, zobraz GM tlačítko "Pokračovat".
+    const allCommitted = game.players.every(p=>game.biz.mlBids[p.playerId]?.committed);
+    if(allCommitted){
+      io.to(`game:${gameId}`).emit("gm_cta_ready", {
+        gameId,
+        kind: "ML_ALL_COMMITTED",
+        year: game.year,
+        bizStep: game.bizStep,
+        label: "Všichni hráči potvrdili ML",
+        cta: "Pokračovat"
+      });
+    }
+  });
   // Move selection (locks markets)
   socket.on("pick_market", (payload, cb) => {
     const { gameId, playerId, marketId } = payload || {};
@@ -908,6 +925,17 @@ io.on("connection", (socket) => {
     ex.used=true;
 
     game.settle.effects.push({ type:"STEAL_BASE_PRODUCTION", fromPlayerId: targetPlayerId, toPlayerId: playerId, cardId, usd });
+
+    // If some players already started audit, update their computed settlements so UI can show "Finální audit".
+    try{
+      for(const p of game.players){
+        const pid = p.playerId;
+        if(game.settle.entries?.[pid]?.committed){
+          const { settlementUsd, breakdown } = calcSettlementFor(game, pid);
+          game.settle.entries[pid] = { ...game.settle.entries[pid], settlementUsd, breakdown };
+        }
+      }
+    }catch(e){}
     ackOk(cb);
     broadcast(game);
   });
