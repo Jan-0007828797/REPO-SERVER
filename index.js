@@ -253,110 +253,8 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
   return { game, gm };
 }
 
-
-function commitStatus(game){
-  const players = game.players.filter(p=>p.role!=="GM");
-  const total = players.length;
-  let committed = 0;
-
-  if(game.status!=="IN_PROGRESS") return { total, committed:0 };
-
-  if(game.phase==="BIZ"){
-    if(game.bizStep==="ML_BID"){
-      committed = players.filter(p=>game.biz.mlBids[p.playerId]?.committed).length;
-    } else if(game.bizStep==="MOVE"){
-      committed = players.filter(p=>game.biz.move[p.playerId]?.committed).length;
-    } else if(game.bizStep==="AUCTION_ENVELOPE"){
-      committed = players.filter(p=>{
-        const e = game.biz.auction.entries[p.playerId];
-        if(!e?.committed) return false;
-        if(e.usedLobbyist){
-          // Ready only after final commit if lobbyist window is active.
-          return !!e.finalCommitted;
-        }
-        return true;
-      }).length;
-    } else if(game.bizStep==="ACQUIRE"){
-      committed = players.filter(p=>game.biz.acquire[p.playerId]?.committed).length;
-    }
-  } else if(game.phase==="CRYPTO"){
-    committed = players.filter(p=>game.crypto.entries[p.playerId]?.committed).length;
-  } else if(game.phase==="SETTLE"){
-    committed = players.filter(p=>game.settle.entries[p.playerId]?.committed).length;
-  }
-
-  return { total, committed };
-}
-
-
-function gamePublic(game, viewerId){
-  const viewer = viewerId ? getPlayer(game, viewerId) : null;
-  const viewerIsGM = !!viewer && viewer.role==="GM";
-
-  const playersOut = game.players.map(p=>{
-    const base = { playerId:p.playerId, name:p.name, role:p.role, marketId:p.marketId };
-    if(viewerIsGM || p.playerId===viewerId){
-      return { ...base, wallet: p.wallet };
-    }
-    return base;
-  });
-
-  // Per-player slices
-  const revealsOut = viewerIsGM ? game.reveals : (viewerId ? { [viewerId]: game.reveals[viewerId] } : {});
-  const lawyerOut  = viewerIsGM ? game.lawyer  : (viewerId ? { protections: { [viewerId]: game.lawyer?.protections?.[viewerId] || {} }, notices: { [viewerId]: game.lawyer?.notices?.[viewerId] || [] } } : {});
-  const invOut     = viewerIsGM ? game.inventory : (viewerId ? { [viewerId]: game.inventory[viewerId] } : {});
-
-  // Business step data with privacy
-  const bizOut = { ...game.biz };
-
-  // ML bids: only own amount (and GM sees all)
-  const ml = {};
-  for(const [pid, v] of Object.entries(game.biz.mlBids || {})){
-    if(viewerIsGM || pid===viewerId) ml[pid] = v;
-    else ml[pid] = { committed: !!v?.committed };
-  }
-  bizOut.mlBids = ml;
-
-  // Auction entries: hide bids and lobbyist usage from others (real privacy)
-  const ae = {};
-  for(const [pid, v] of Object.entries(game.biz.auction?.entries || {})){
-    if(viewerIsGM || pid===viewerId){
-      ae[pid] = v;
-    }else{
-      ae[pid] = { committed: !!v?.committed, finalCommitted: !!v?.finalCommitted };
-    }
-  }
-  bizOut.auction = { ...bizOut.auction, entries: ae };
-  // lobbyistPhaseActive is hidden from non-GM to avoid signaling
-  if(!viewerIsGM){
-    bizOut.auction.lobbyistPhaseActive = false;
-  }
-
-  // Move locks are public enough (board-visible)
-  // Acquire commits: only own (and GM sees who committed)
-  const acq = {};
-  for(const p of game.players){
-    const pid = p.playerId;
-    const v = game.biz.acquire?.[pid];
-    if(viewerIsGM || pid===viewerId) acq[pid] = v;
-    else if(v) acq[pid] = { committed: !!v.committed };
-  }
-  bizOut.acquire = acq;
-
-  // Crypto entries: only own amounts
-  const cryptoOut = { ...game.crypto, entries: {} };
-  for(const [pid, v] of Object.entries(game.crypto.entries || {})){
-    if(viewerIsGM || pid===viewerId) cryptoOut.entries[pid] = v;
-    else cryptoOut.entries[pid] = { committed: !!v?.committed };
-  }
-
-  // Settle entries: only own breakdown/amount; others only committed
-  const settleOut = { ...game.settle, entries: {} };
-  for(const [pid, v] of Object.entries(game.settle.entries || {})){
-    if(viewerIsGM || pid===viewerId) settleOut.entries[pid] = v;
-    else settleOut.entries[pid] = { committed: !!v?.committed };
-  }
-
+function gamePublic(game){
+  // for test we can ship a lot; reveals should be per-player (client will select)
   return {
     gameId: game.gameId,
     status: game.status,
@@ -364,36 +262,28 @@ function gamePublic(game, viewerId){
     year: game.year,
     phase: game.phase,
     bizStep: game.bizStep,
-
-    commitStatus: commitStatus(game),
-
-    players: playersOut,
+    players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, marketId:p.marketId, wallet:p.wallet })),
     trends: game.trends,
-    reveals: revealsOut,
-    lawyer: lawyerOut,
-    inventory: invOut,
-
+    reveals: game.reveals,
+    lawyer: game.lawyer,
+    inventory: game.inventory,
     available: {
       investments: Array.from(game.availableCards.investments),
       miningFarms: Array.from(game.availableCards.miningFarms),
       experts: Array.from(game.availableCards.experts),
     },
-    catalog: { markets: CATALOG.markets },
-    biz: bizOut,
-    crypto: cryptoOut,
-    settle: settleOut
+    catalog: {
+      markets: CATALOG.markets,
+    },
+    biz: game.biz,
+    crypto: game.crypto,
+    settle: game.settle
   };
 }
 
-async function broadcast(game){
-  const room = `game:${game.gameId}`;
-  const sockets = await io.in(room).fetchSockets();
-  for(const sk of sockets){
-    const viewerId = sk.data?.playerId || null;
-    sk.emit("game_state", gamePublic(game, viewerId));
-  }
+function broadcast(game){
+  io.to(`game:${game.gameId}`).emit("game_state", gamePublic(game));
 }
-
 
 function ackOk(cb, payload){ if(typeof cb==="function") cb({ ok:true, ...(payload||{}) }); }
 function ackErr(cb, error, code){ if(typeof cb==="function") cb({ ok:false, error, code }); }
@@ -443,7 +333,6 @@ function canUseLawyerNow(game, trend){
   const req = trend?.lawyer?.phase;
   if(!trend?.lawyer?.allowed) return false;
   if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="TRENDS";
-  if(req==="BIZ_ML_ONLY") return phase==="BIZ" && biz==="ML_BID";
   if(req==="BIZ_MOVE_ONLY") return phase==="BIZ" && biz==="MOVE";
   if(req==="AUDIT_ANYTIME_BEFORE_CLOSE") return phase==="SETTLE";
   return false;
@@ -465,10 +354,20 @@ function applyTrendTriggers_OnTrendsToML(game){
   }
 
   // For each player apply in this exact order:
-// 1) Forks – positive (applied when the year starts / Market Leader becomes active)
-// 2) Hyperinflation – not applied by app, only notice if protected (players verify physically)
-for(const p of game.players){
+  // 1) Exchange hack (halve all) – negative, lawyer can protect
+  // 2) Forks – positive
+  // 3) Hyperinflation – not applied by app, only notice if protected
+  for(const p of game.players){
     const pid = p.playerId;
+
+    if(has("EXCHANGE_HACK") && !isProtectedFrom(game, pid, "EXCHANGE_HACK")){
+      for(const sym of ["BTC","ETH","LTC","SIA"]){
+        const v = Math.floor(Number(p.wallet?.crypto?.[sym]||0) / 2);
+        p.wallet.crypto[sym] = v;
+      }
+    } else if(has("EXCHANGE_HACK") && isProtectedFrom(game, pid, "EXCHANGE_HACK")){
+      addNotice(game, pid, "EXCHANGE_HACK", "Ochráněno právníkem před hackerským útokem na kryptoburzu (krypto zůstatky se nesnížily).");
+    }
 
     if(has("FORK_BTC_ETH")){
       p.wallet.crypto.BTC = Number(p.wallet.crypto.BTC||0) * 2;
@@ -481,28 +380,6 @@ for(const p of game.players){
 
     if(has("HYPERINFLATION_USD_HALVE") && isProtectedFrom(game, pid, "HYPERINFLATION_USD_HALVE")){
       addNotice(game, pid, "HYPERINFLATION_USD_HALVE", "Ochráněno právníkem před Hyperinflací (tento hráč si NEodečítá 1/2 USD).");
-    }
-  }
-}
-
-
-function applyTrendTriggers_OnLeaveML(game){
-  // Triggered when GM advances from Market Leader to the next screen.
-  // Applies only the hacker attack (halve crypto holdings) if active and not protected by lawyer.
-  const globals = currentYearGlobals(game);
-  const has = (k)=> globals.some(t=>t.key===k);
-
-  if(!has("EXCHANGE_HACK")) return;
-
-  for(const p of game.players){
-    const pid = p.playerId;
-    if(isProtectedFrom(game, pid, "EXCHANGE_HACK")){
-      addNotice(game, pid, "EXCHANGE_HACK", "Ochráněno právníkem před hackerským útokem na kryptoburzu (krypto zůstatky se nesnížily).");
-      continue;
-    }
-    for(const sym of ["BTC","ETH","LTC","SIA"]){
-      const v = Math.floor(Number(p.wallet?.crypto?.[sym]||0) / 2);
-      p.wallet.crypto[sym] = v;
     }
   }
 }
@@ -521,12 +398,8 @@ function resetStepData(game){
 function startNewYear(game){
   game.year += 1;
   game.phase = "BIZ";
-  game.bizStep = "ML_BID";
+  game.bizStep = "TRENDS";
   resetStepData(game);
-
-  // Activate yearly trend effects that are meant to happen at the start of Market Leader.
-  // (Crypto rate coefficients + forks + hyperinflation notices.)
-  applyTrendTriggers_OnTrendsToML(game);
 
   // initialize per-player step objects
   for(const p of game.players){
@@ -592,6 +465,7 @@ function canBack(game){
   if(game.status!=="IN_PROGRESS") return false;
 
   if(game.phase==="BIZ"){
+    if(game.bizStep==="TRENDS") return true; // can go back to previous phase? handled separately; allow for now
     if(game.bizStep==="ML_BID"){
       return !Object.values(game.biz.mlBids).some(v=>v?.committed);
     }
@@ -600,9 +474,6 @@ function canBack(game){
     }
     if(game.bizStep==="AUCTION_ENVELOPE"){
       return !Object.values(game.biz.auction.entries).some(v=>v?.committed || v?.finalCommitted);
-    }
-    if(game.bizStep==="ACQUIRE"){
-      return !Object.values(game.biz.acquire||{}).some(v=>v?.committed);
     }
   }
   if(game.phase==="CRYPTO"){
@@ -616,7 +487,8 @@ function canBack(game){
 
 function gmNext(game){
   if(game.phase==="BIZ"){
-    if(game.bizStep==="ML_BID"){ applyTrendTriggers_OnLeaveML(game); game.bizStep="MOVE"; return; }
+    if(game.bizStep==="TRENDS"){ applyTrendTriggers_OnTrendsToML(game); game.bizStep="ML_BID"; return; }
+    if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
     if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
   } else if(game.phase==="CRYPTO"){
@@ -642,37 +514,6 @@ function gmBack(game){
     game.phase="BIZ"; game.bizStep="AUCTION_ENVELOPE"; return;
   } else if(game.phase==="SETTLE"){
     game.phase="CRYPTO"; return;
-  }
-}
-
-
-async function sendAuctionIntel(game){
-  // Sends private intel (others' bids) only to players who used a lobbyist in AUCTION.
-  if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return;
-  const entries = game.biz.auction.entries || {};
-  const anyLobby = Object.values(entries).some(v=>v?.usedLobbyist);
-  if(!anyLobby) return;
-
-  const players = game.players.filter(p=>p.role!=="GM");
-  const allCommitted = players.every(p=>entries[p.playerId]?.committed);
-  if(!allCommitted) return;
-
-  // Activate lobbyist phase internally.
-  game.biz.auction.lobbyistPhaseActive = true;
-
-  const intel = players
-    .map(p=>({ playerId: p.playerId, name: p.name, bidUsd: entries[p.playerId]?.bidUsd ?? null }))
-    .filter(x=>x.playerId); // keep order
-
-  const room = `game:${game.gameId}`;
-  const sockets = await io.in(room).fetchSockets();
-  for(const sk of sockets){
-    const pid = sk.data?.playerId;
-    if(!pid) continue;
-    const e = entries[pid];
-    if(e?.usedLobbyist && !e.finalCommitted){
-      sk.emit("auction_intel", { gameId: game.gameId, year: game.year, intel });
-    }
   }
 }
 
@@ -721,15 +562,12 @@ io.on("connection", (socket) => {
   });
 
   socket.on("watch_game", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+    const { gameId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
     socket.join(`game:${gameId}`);
-    // bind this socket to a specific playerId for privacy-aware state
-    if(playerId) socket.data.playerId = playerId;
-    socket.data.gameId = gameId;
     ackOk(cb);
-    io.to(socket.id).emit("game_state", gamePublic(game, playerId));
+    io.to(socket.id).emit("game_state", gamePublic(game));
   });
 
   socket.on("start_game", (payload, cb) => {
@@ -758,8 +596,6 @@ io.on("connection", (socket) => {
     gmNext(game);
     ackOk(cb);
     broadcast(game);
-    // If all committed and someone used lobbyist, send private intel immediately.
-    sendAuctionIntel(game);
   });
 
   socket.on("gm_back", (payload, cb) => {
@@ -966,21 +802,7 @@ io.on("connection", (socket) => {
     broadcast(game);
   });
 
-  
-  // Acquire commit (player confirms whether they got any cards this phase)
-  socket.on("commit_acquire", (payload, cb) => {
-    const { gameId, playerId, gotAny } = payload || {};
-    const game = getGame(gameId);
-    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
-    if(game.phase!=="BIZ" || game.bizStep!=="ACQUIRE") return ackErr(cb, "Not ACQUIRE step", "BAD_STATE");
-    if(game.biz.acquire[playerId]?.committed) return ackErr(cb, "Already committed", "ALREADY");
-
-    game.biz.acquire[playerId] = { committed:true, gotAny: !!gotAny, ts: now() };
-    ackOk(cb);
-    broadcast(game);
-  });
-
-// Scan cards
+  // Scan cards
   socket.on("scan_card", (payload, cb) => {
     const { gameId, playerId, cardQr } = payload || {};
     const game = getGame(gameId);
