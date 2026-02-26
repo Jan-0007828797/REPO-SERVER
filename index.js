@@ -221,7 +221,7 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
 
     year: 0,
     phase: null,      // "BIZ"|"CRYPTO"|"SETTLE"
-    bizStep: null,    // "TRENDS"|"ML_BID"|"MOVE"|"AUCTION_ENVELOPE"
+    bizStep: null,    // "ML_BID"|"MOVE"|"AUCTION_ENVELOPE"|"ACQUIRE"
 
     // committed values – purely for display & consistency
     biz: {
@@ -231,6 +231,10 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
       auction: {
         entries: {},        // pid -> { bidUsd:null|number, committed, usedLobbyist, finalBidUsd, finalCommitted }
         lobbyistPhaseActive: false,
+      }
+      ,
+      acquire: {
+        entries: {} // pid -> { committed:boolean, gotCard:boolean }
       }
     },
 
@@ -332,7 +336,8 @@ function canUseLawyerNow(game, trend){
   const biz = game.bizStep;
   const req = trend?.lawyer?.phase;
   if(!trend?.lawyer?.allowed) return false;
-  if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="TRENDS";
+  // "TRENDS" step was removed; treat it as the start-of-year window during Market Leader.
+  if(req==="BIZ_TRENDS_ONLY") return phase==="BIZ" && biz==="ML_BID";
   if(req==="BIZ_MOVE_ONLY") return phase==="BIZ" && biz==="MOVE";
   if(req==="AUDIT_ANYTIME_BEFORE_CLOSE") return phase==="SETTLE";
   return false;
@@ -388,6 +393,7 @@ function resetStepData(game){
   game.biz.mlBids = {};
   game.biz.move = {};
   game.biz.auction = { entries:{}, lobbyistPhaseActive:false };
+  game.biz.acquire = { entries:{} };
   game.settle.effects = [];
   game.settle.entries = {};
   game.crypto.entries = {};
@@ -398,8 +404,12 @@ function resetStepData(game){
 function startNewYear(game){
   game.year += 1;
   game.phase = "BIZ";
-  game.bizStep = "TRENDS";
+  // Trends are activated automatically at year start; players view them in ML intro modal.
+  game.bizStep = "ML_BID";
   resetStepData(game);
+
+  // Apply trend triggers at the moment the year starts (previously happened in the removed "TRENDS" step)
+  applyTrendTriggers_OnTrendsToML(game);
 
   // initialize per-player step objects
   for(const p of game.players){
@@ -465,7 +475,6 @@ function canBack(game){
   if(game.status!=="IN_PROGRESS") return false;
 
   if(game.phase==="BIZ"){
-    if(game.bizStep==="TRENDS") return true; // can go back to previous phase? handled separately; allow for now
     if(game.bizStep==="ML_BID"){
       return !Object.values(game.biz.mlBids).some(v=>v?.committed);
     }
@@ -474,6 +483,9 @@ function canBack(game){
     }
     if(game.bizStep==="AUCTION_ENVELOPE"){
       return !Object.values(game.biz.auction.entries).some(v=>v?.committed || v?.finalCommitted);
+    }
+    if(game.bizStep==="ACQUIRE"){
+      return !Object.values(game.biz.acquire.entries).some(v=>v?.committed);
     }
   }
   if(game.phase==="CRYPTO"){
@@ -487,10 +499,10 @@ function canBack(game){
 
 function gmNext(game){
   if(game.phase==="BIZ"){
-    if(game.bizStep==="TRENDS"){ applyTrendTriggers_OnTrendsToML(game); game.bizStep="ML_BID"; return; }
     if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
     if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
-    if(game.bizStep==="AUCTION_ENVELOPE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
+    if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="ACQUIRE"; return; }
+    if(game.bizStep==="ACQUIRE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="SETTLE"; return;
   } else if(game.phase==="SETTLE"){
@@ -507,11 +519,11 @@ function gmNext(game){
 
 function gmBack(game){
   if(game.phase==="BIZ"){
-    if(game.bizStep==="ML_BID"){ game.bizStep="TRENDS"; return; }
     if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; return; }
+    if(game.bizStep==="ACQUIRE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
   } else if(game.phase==="CRYPTO"){
-    game.phase="BIZ"; game.bizStep="AUCTION_ENVELOPE"; return;
+    game.phase="BIZ"; game.bizStep="ACQUIRE"; return;
   } else if(game.phase==="SETTLE"){
     game.phase="CRYPTO"; return;
   }
@@ -799,6 +811,65 @@ io.on("connection", (socket) => {
     entry.finalBidUsd = val;
     entry.finalCommitted = true;
     ackOk(cb);
+    broadcast(game);
+  });
+
+  // Acquisition commit (definitive decision for this step)
+  socket.on("commit_acquire", (payload, cb) => {
+    const { gameId, playerId, gotCard } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="BIZ" || game.bizStep!=="ACQUIRE") return ackErr(cb, "Not ACQUIRE step", "BAD_STATE");
+
+    game.biz.acquire.entries[playerId] = { committed:true, gotCard: !!gotCard, ts: now() };
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Card scan helpers (preview vs claim)
+  socket.on("scan_preview", (payload, cb) => {
+    const { gameId, cardQr } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const id = String(cardQr||"").trim();
+    if(!id) return ackErr(cb, "Bad QR", "BAD_INPUT");
+
+    const card = CATALOG.investments.find(c=>c.cardId===id)
+      || CATALOG.miningFarms.find(c=>c.cardId===id)
+      || CATALOG.experts.find(c=>c.cardId===id);
+    if(!card) return ackErr(cb, "Unknown card", "UNKNOWN");
+
+    const sets = game.availableCards;
+    const set = card.kind==="INVESTMENT" ? sets.investments : card.kind==="MINING_FARM" ? sets.miningFarms : sets.experts;
+    if(!set.has(card.cardId)) return ackErr(cb, "Karta není v nabídce.", "NOT_AVAILABLE");
+
+    ackOk(cb, { card });
+  });
+
+  socket.on("claim_card", (payload, cb) => {
+    const { gameId, playerId, cardId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const id = String(cardId||"").trim();
+    if(!id) return ackErr(cb, "Bad cardId", "BAD_INPUT");
+
+    const card = CATALOG.investments.find(c=>c.cardId===id)
+      || CATALOG.miningFarms.find(c=>c.cardId===id)
+      || CATALOG.experts.find(c=>c.cardId===id);
+    if(!card) return ackErr(cb, "Unknown card", "UNKNOWN");
+
+    const sets = game.availableCards;
+    const set = card.kind==="INVESTMENT" ? sets.investments : card.kind==="MINING_FARM" ? sets.miningFarms : sets.experts;
+    if(!set.has(card.cardId)) return ackErr(cb, "Karta není v nabídce.", "NOT_AVAILABLE");
+
+    set.delete(card.cardId);
+    const inv = game.inventory[playerId] || blankInventory();
+    if(card.kind==="EXPERT") inv.experts.push({ ...card, used:false });
+    else if(card.kind==="INVESTMENT") inv.investments.push({ ...card });
+    else inv.miningFarms.push({ ...card });
+    game.inventory[playerId]=inv;
+
+    ackOk(cb, { card });
     broadcast(game);
   });
 
