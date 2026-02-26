@@ -259,6 +259,7 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
 
 function gamePublic(game){
   // for test we can ship a lot; reveals should be per-player (client will select)
+  const gmAdvance = computeGmAdvance(game);
   return {
     gameId: game.gameId,
     status: game.status,
@@ -281,7 +282,81 @@ function gamePublic(game){
     },
     biz: game.biz,
     crypto: game.crypto,
-    settle: game.settle
+    settle: game.settle,
+    gmAdvance
+  };
+}
+
+function activePlayerIds(game){
+  return (game.players||[]).filter(p=>p.role!=="GM").map(p=>p.playerId);
+}
+
+function allCommittedForStep(game){
+  const pids = activePlayerIds(game);
+  if(!pids.length) return { ready:false, reason:"NO_PLAYERS" };
+
+  if(game.phase==="BIZ"){
+    if(game.bizStep==="ML_BID"){
+      const map = game.biz?.mlBids || {};
+      const ok = pids.every(pid=>map?.[pid]?.committed);
+      return { ready: ok, reason:"ML_BID" };
+    }
+    if(game.bizStep==="MOVE"){
+      const map = game.biz?.move || {};
+      const ok = pids.every(pid=>map?.[pid]?.committed);
+      return { ready: ok, reason:"MOVE" };
+    }
+    if(game.bizStep==="AUCTION_ENVELOPE"){
+      const entries = game.biz?.auction?.entries || {};
+      const allEnvelope = pids.every(pid=>entries?.[pid]?.committed);
+      if(!allEnvelope) return { ready:false, reason:"AUCTION_ENVELOPE" };
+      // If lobbyist window is active, require final bids for lobbyist users.
+      if(game.biz?.auction?.lobbyistPhaseActive){
+        const okFinal = pids.every(pid=>{
+          const e = entries?.[pid];
+          if(!e?.usedLobbyist) return true;
+          return !!e?.finalCommitted;
+        });
+        return { ready: okFinal, reason:"AUCTION_FINAL" };
+      }
+      return { ready:true, reason:"AUCTION_ENVELOPE" };
+    }
+    if(game.bizStep==="ACQUIRE"){
+      const map = game.biz?.acquire?.entries || {};
+      const ok = pids.every(pid=>map?.[pid]?.committed);
+      return { ready: ok, reason:"ACQUIRE" };
+    }
+  }
+
+  if(game.phase==="CRYPTO"){
+    const map = game.crypto?.entries || {};
+    const ok = pids.every(pid=>map?.[pid]?.committed);
+    return { ready: ok, reason:"CRYPTO" };
+  }
+  if(game.phase==="SETTLE"){
+    const map = game.settle?.entries || {};
+    const ok = pids.every(pid=>map?.[pid]?.committed);
+    return { ready: ok, reason:"SETTLE" };
+  }
+  return { ready:false, reason:"UNKNOWN" };
+}
+
+function computeGmAdvance(game){
+  // Alternative (assist) path for GM: show big OK once all players made a definitive decision.
+  // Manual GM phase control via GM panel remains unchanged.
+  const step = (()=>{
+    if(game.phase==="BIZ") return game.bizStep;
+    if(game.phase==="CRYPTO") return "CRYPTO";
+    if(game.phase==="SETTLE") return "SETTLE";
+    return null;
+  })();
+  const key = `${game.gameId}:${game.status}:${game.year}:${game.phase||""}:${step||""}`;
+  const { ready, reason } = allCommittedForStep(game);
+  return {
+    key,
+    ready: !!ready,
+    step,
+    reason
   };
 }
 
