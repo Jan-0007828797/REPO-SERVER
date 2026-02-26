@@ -590,6 +590,11 @@ io.on("connection", (socket) => {
 
     // Bind this socket to the player for presence tracking
     socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
+    socket.join(`game:${game.gameId}`);
+
+    ackOk(cb, { playerId: p.playerId, seatIndex: p.seatIndex });
+    broadcast(game);
+  });
 
   socket.on("reconnect_game", (payload, cb) => {
     const { gameId, playerId } = payload || {};
@@ -602,13 +607,13 @@ io.on("connection", (socket) => {
     socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
     socket.join(`game:${game.gameId}`);
 
-    ackOk(cb, { playerId: p.playerId, role: p.role, seatIndex: p.seatIndex });
-    broadcast(game);
-  });
-
-    socket.join(`game:${game.gameId}`);
-
-    ackOk(cb, { playerId: p.playerId, seatIndex: p.seatIndex });
+    ackOk(cb, {
+      gameId: game.gameId,
+      gameStatus: game.status,
+      playerId: p.playerId,
+      role: p.role,
+      seatIndex: p.seatIndex
+    });
     broadcast(game);
   });
 
