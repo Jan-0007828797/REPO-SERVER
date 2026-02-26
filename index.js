@@ -16,6 +16,9 @@ app.get("/health", (req,res)=> res.json({ ok:true, ts: Date.now() }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: true, methods: ["GET","POST"] } });
 
+// Track socket -> player binding for presence
+const socketBindings = new Map();
+
 /**
  * Kryptopoly v3.2 (spec-aligned)
  * - GM is the only one who advances steps/phases/years.
@@ -181,11 +184,13 @@ function generateTrends(yearsTotal){
 // Game store
 const games = new Map();
 
-function makePlayer(name, role){
+function makePlayer(name, role, seatIndex){
   return {
     playerId: shortId(),
-    name: String(name||"").slice(0,32) || "Hráč",
+    name: String(name||"").trim().slice(0,32) || "Hráč",
     role,
+    seatIndex: (typeof seatIndex==="number" ? seatIndex : null),
+    connected: false,
     joinedAt: now(),
     marketId: null,
     wallet: { usd: 0, crypto: { BTC:3, ETH:3, LTC:3, SIA:3 } }
@@ -196,9 +201,24 @@ function blankInventory(){
   return { investments: [], miningFarms: [], experts: [] };
 }
 
+
+function normName(n){ return String(n||"").trim().toLowerCase(); }
+function isNameTaken(game, name){
+  const nn = normName(name);
+  return game.players.some(p => normName(p.name)===nn);
+}
+function nextFreeSeatIndex(game){
+  // seats: GM=0, players=1..5 (max 6 incl GM)
+  const used = new Set(game.players.map(p=>p.seatIndex).filter(v=>typeof v==="number"));
+  for(let i=1;i<=5;i++){
+    if(!used.has(i)) return i;
+  }
+  return null;
+}
+
 function newGame({ gmName, yearsTotal, maxPlayers }){
   const gameId = shortId();
-  const gm = makePlayer(gmName, "GM");
+  const gm = makePlayer(gmName, "GM", 0);
 
   const game = {
     gameId,
@@ -266,7 +286,7 @@ function gamePublic(game){
     year: game.year,
     phase: game.phase,
     bizStep: game.bizStep,
-    players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, marketId:p.marketId, wallet:p.wallet })),
+    players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, seatIndex:p.seatIndex, connected: !!p.connected, marketId:p.marketId, wallet:p.wallet })),
     trends: game.trends,
     reveals: game.reveals,
     lawyer: game.lawyer,
@@ -535,6 +555,9 @@ io.on("connection", (socket) => {
     try{
       const { name, yearsTotal, maxPlayers } = payload || {};
       const { game, gm } = newGame({ gmName:name, yearsTotal, maxPlayers });
+      gm.connected = true;
+      socketBindings.set(socket.id, { gameId: game.gameId, playerId: gm.playerId });
+      socket.join(`game:${game.gameId}`);
       ackOk(cb, { gameId: game.gameId, playerId: gm.playerId, role: gm.role });
       io.to(socket.id).emit("created_game", { gameId: game.gameId, playerId: gm.playerId });
     }catch(e){
@@ -545,38 +568,89 @@ io.on("connection", (socket) => {
   socket.on("join_game", (payload, cb) => {
     const { gameId, name } = payload || {};
     const game = getGame(gameId);
-    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
-    if(game.status!=="LOBBY" && game.status!=="IN_PROGRESS") return ackErr(cb, "Game closed", "CLOSED");
-    if(game.players.length >= game.config.maxPlayers) return ackErr(cb, "Game full", "FULL");
+    if(!game) return ackErr(cb, "Hra nenalezena", "NOT_FOUND");
 
-    const p = makePlayer(name, "PLAYER");
+    // Nové připojení povoleno jen v lobby (stabilita + férovost)
+    if(game.status!=="LOBBY") return ackErr(cb, "Hra už běží. Připojit se mohou jen původní hráči.", "IN_PROGRESS");
+
+    const n = String(name||"").trim();
+    if(!n) return ackErr(cb, "Zadej přezdívku.", "NAME_REQUIRED");
+    if(isNameTaken(game, n)) return ackErr(cb, "Tahle přezdívka už ve hře je. Zkus jinou.", "NAME_TAKEN");
+    if(game.players.length >= game.config.maxPlayers) return ackErr(cb, "Hra je plná", "FULL");
+
+    const seatIndex = nextFreeSeatIndex(game);
+    if(seatIndex==null) return ackErr(cb, "Hra je plná", "FULL");
+
+    const p = makePlayer(n, "PLAYER", seatIndex);
+    p.connected = true;
+
     game.players.push(p);
     game.inventory[p.playerId] = blankInventory();
     game.reveals[p.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
 
-    ackOk(cb, { playerId: p.playerId });
+    // Bind this socket to the player for presence tracking
+    socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
+
+  socket.on("reconnect_game", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Hra nenalezena", "NOT_FOUND");
+    const p = (game.players||[]).find(x => x.playerId===playerId);
+    if(!p) return ackErr(cb, "Profil v této hře nenalezen", "NO_PLAYER");
+
+    p.connected = true;
+    socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
+    socket.join(`game:${game.gameId}`);
+
+    ackOk(cb, { playerId: p.playerId, role: p.role, seatIndex: p.seatIndex });
     broadcast(game);
   });
 
+    socket.join(`game:${game.gameId}`);
+
+    ackOk(cb, { playerId: p.playerId, seatIndex: p.seatIndex });
+    broadcast(game);
+  });
+
+
+  
   socket.on("watch_lobby", (payload, cb) => {
-    const { gameId } = payload || {};
+    const { gameId, playerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+
+    // presence
+    if(playerId){
+      const p = (game.players||[]).find(x=>x.playerId===playerId);
+      if(p){ p.connected = true; socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId }); }
+    }
+
     socket.join(`game:${gameId}`);
     ackOk(cb);
-    // lobby_update for compatibility
     io.to(socket.id).emit("lobby_update", {
       gameId,
       config: game.config,
-      players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role: p.role==="GM"?"GM":"PLAYER" }))
+      players: game.players.map(p=>({
+        playerId:p.playerId,
+        name:p.name,
+        role:p.role,
+        seatIndex:p.seatIndex,
+        connected: !!p.connected
+      }))
     });
     io.to(socket.id).emit("game_state", gamePublic(game));
   });
 
   socket.on("watch_game", (payload, cb) => {
-    const { gameId } = payload || {};
+    const { gameId, playerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+
+    if(playerId){
+      const p = (game.players||[]).find(x=>x.playerId===playerId);
+      if(p){ p.connected = true; socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId }); }
+    }
+
     socket.join(`game:${gameId}`);
     ackOk(cb);
     io.to(socket.id).emit("game_state", gamePublic(game));
@@ -1037,7 +1111,20 @@ io.on("connection", (socket) => {
       return ackErr(cb, "Chyba preview auditu.");
     }
   });
+  socket.on("disconnect", () => {
+      const b = socketBindings.get(socket.id);
+      if(!b) return;
+      socketBindings.delete(socket.id);
+      const game = getGame(b.gameId);
+      if(!game) return;
+      const p = (game.players||[]).find(x=>x.playerId===b.playerId);
+      if(p){ p.connected = false; broadcast(game); }
+    });
+
+
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log("Server listening on", PORT));
+  
+
