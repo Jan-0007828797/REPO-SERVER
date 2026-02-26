@@ -501,7 +501,7 @@ function gmNext(game){
   if(game.phase==="BIZ"){
     if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
     if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
-    if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="ACQUIRE"; return; }
+    if(game.bizStep==="AUCTION_ENVELOPE"){ game.biz.auction.lobbyistPhaseActive = false; game.bizStep="ACQUIRE"; return; }
     if(game.bizStep==="ACQUIRE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="SETTLE"; return;
@@ -521,7 +521,7 @@ function gmBack(game){
   if(game.phase==="BIZ"){
     if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; return; }
-    if(game.bizStep==="ACQUIRE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
+    if(game.bizStep==="ACQUIRE"){ game.biz.auction.lobbyistPhaseActive = false; game.bizStep="AUCTION_ENVELOPE"; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="BIZ"; game.bizStep="ACQUIRE"; return;
   } else if(game.phase==="SETTLE"){
@@ -772,6 +772,18 @@ io.on("connection", (socket) => {
       finalCommitted:false,
       ts: now()
     };
+
+    // Auto-start lobbyist subphase when everyone committed AND someone used lobbyist.
+    // This keeps the game flowing and preserves secrecy for other players.
+    try{
+      const entries = game.biz.auction.entries;
+      const allCommitted = game.players.every(p=>entries[p.playerId]?.committed);
+      if(allCommitted){
+        const anyLobby = Object.values(entries).some(v=>v?.usedLobbyist);
+        if(anyLobby) game.biz.auction.lobbyistPhaseActive = true;
+      }
+    }catch{}
+
     ackOk(cb);
     broadcast(game);
   });
@@ -805,8 +817,12 @@ io.on("connection", (socket) => {
     const entry = game.biz.auction.entries[playerId];
     if(!entry?.usedLobbyist) return ackErr(cb, "Not a lobbyist user", "FORBIDDEN");
 
-    const val = Math.floor(Number(finalBidUsd));
-    if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid bid", "BAD_INPUT");
+    let val = finalBidUsd;
+    if(val===null) val = null;
+    else {
+      val = Math.floor(Number(val));
+      if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid bid", "BAD_INPUT");
+    }
 
     entry.finalBidUsd = val;
     entry.finalCommitted = true;
