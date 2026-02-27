@@ -325,6 +325,7 @@ function gameView(game, viewerPlayerId){
     status: game.status,
     config: game.config,
     year: game.year,
+    basePriceUsd: basePriceUsd(game),
     phase: game.phase,
     bizStep: game.bizStep,
     players: game.players.map(p=>({ playerId:p.playerId, name:p.name, role:p.role, seatIndex:p.seatIndex, connected: !!p.connected, marketId:p.marketId, wallet:p.wallet })),
@@ -381,6 +382,13 @@ function currentYearCrypto(game){
 function currentYearGlobals(game){
   const y = game.year || 1;
   return (game.trends?.byYear?.[String(y)]?.globals) || [];
+}
+
+// Inflation / price level ("základní cena")
+// Rok 1: 5k, Rok 2: 10k, ... Rok 5: 25k
+function basePriceUsd(game){
+  const y = Math.max(1, Number(game?.year || 1));
+  return 5000 * y;
 }
 
 function ensureLawyerStore(game, playerId){
