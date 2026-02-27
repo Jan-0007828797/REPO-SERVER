@@ -153,12 +153,24 @@ function loadCryptoTrends(){
   const cryptoTrends = loadCryptoTrends();
 
 
-  const markets = markets12.map((m, idx)=>({
-    marketId: m,
-    label: `Trh ${idx+1}`,
-    continent: continents[idx % continents.length],
-    type: ["AGRO","INDUSTRY","MINING","ENERGY","TECH","LOGISTICS"][idx % 6]
-  }));
+  const markets = [
+    // Two markets per continent. No continent has two identical market types.
+    // Types align with Bible traditional-investment types: AGRO (Zemědělství), INDUSTRY (Průmysl), MINING (Těžba).
+    { marketId: "M01", label: "Trh", continent: "EUROPE", type: "AGRO" },
+    { marketId: "M02", label: "Trh", continent: "ASIA", type: "INDUSTRY" },
+    { marketId: "M03", label: "Trh", continent: "AFRICA", type: "MINING" },
+    { marketId: "M04", label: "Trh", continent: "N_AMERICA", type: "INDUSTRY" },
+    { marketId: "M05", label: "Trh", continent: "S_AMERICA", type: "AGRO" },
+    { marketId: "M06", label: "Trh", continent: "OCEANIA", type: "AGRO" },
+
+    { marketId: "M07", label: "Trh", continent: "EUROPE", type: "INDUSTRY" },
+    { marketId: "M08", label: "Trh", continent: "ASIA", type: "MINING" },
+    { marketId: "M09", label: "Trh", continent: "AFRICA", type: "AGRO" },
+    { marketId: "M10", label: "Trh", continent: "N_AMERICA", type: "MINING" },
+    { marketId: "M11", label: "Trh", continent: "S_AMERICA", type: "MINING" },
+    { marketId: "M12", label: "Trh", continent: "OCEANIA", type: "INDUSTRY" },
+  ];
+
 
   return { investments, miningFarms, experts, globalTrends, regionalTrends, cryptoTrends, continents, markets };
 })();
