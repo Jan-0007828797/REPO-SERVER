@@ -53,18 +53,14 @@ const CATALOG = (() => {
       usdProduction: 2 + (n % 7)
     };
   });
-  const crypto = ["BTC","ETH","LTC","SIA"];
-  const miningFarms = Array.from({length:4}, (_,i)=>{
-    const n=i+1;
-    return {
-      cardId:`MF${String(n).padStart(3,"0")}`,
-      kind:"MINING_FARM",
-      name:`Mining farma ${n}`,
-      crypto: crypto[i],
-      cryptoProduction: 1 + (n%2),
-      electricityUSD: 2 + n
-    };
-  });
+  // Mining farms (spec-aligned): production in units (ks) per year, electricity is USD cost per year.
+  // MF001 BTC 3, MF002 ETH 6, MF003 LTC 12, MF004 SIA 24; electricity 12,000 USD each.
+  const miningFarms = [
+    { cardId:"MF001", kind:"MINING_FARM", name:"Mining farma BTC", crypto:"BTC", cryptoProduction:3, electricityUSD:12000 },
+    { cardId:"MF002", kind:"MINING_FARM", name:"Mining farma ETH", crypto:"ETH", cryptoProduction:6, electricityUSD:12000 },
+    { cardId:"MF003", kind:"MINING_FARM", name:"Mining farma LTC", crypto:"LTC", cryptoProduction:12, electricityUSD:12000 },
+    { cardId:"MF004", kind:"MINING_FARM", name:"Mining farma SIA", crypto:"SIA", cryptoProduction:24, electricityUSD:12000 },
+  ];
   const expertFuncs = [
     ["ANALYST","Analytik","Odhalí 3 globální trendy nejbližšího skrytého roku."],
     ["CRYPTOGURU","Kryptoguru","Odhalí kryptotrend nejbližšího skrytého roku."],
@@ -197,6 +193,22 @@ function makePlayer(name, role, seatIndex){
   };
 }
 
+// Cards use "units" where 1 == 1,000 USD (confirmed by user)
+const USD_UNIT = 1000;
+const BONUS_BY_THRESHOLD = [
+  { n: 6, usd: 50000 },
+  { n: 4, usd: 25000 },
+  { n: 2, usd: 10000 },
+];
+
+function bonusForCount(count){
+  const c = Number(count||0);
+  for(const t of BONUS_BY_THRESHOLD){
+    if(c >= t.n) return t.usd;
+  }
+  return 0;
+}
+
 function blankInventory(){
   return { investments: [], miningFarms: [], experts: [] };
 }
@@ -265,8 +277,12 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
     },
 
     settle: {
-      entries: {},  // pid -> { settlementUsd:number, committed:boolean, breakdown:[{label,usd}] }
-      effects: []   // applied expert effects for this year
+      // New audit flow:
+      // PREVIEW -> players choose secret actions -> STARTED (ready) -> FINAL -> PAID (amount-only lock)
+      stage: "PREVIEW",
+      entries: {},  // pid -> { started:boolean, finalUsd:number|null, finalBreakdown:Array|null, paid:boolean }
+      pending: {},  // pid -> { lawyer:null|{mode,trendKey?}, lobby:[{type,targetPid}] }
+      // NOTE: legacy "effects" removed; audit effects are derived from pending+inventories when all started.
     }
   };
 
@@ -277,8 +293,21 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
   return { game, gm };
 }
 
-function gamePublic(game){
-  // for test we can ship a lot; reveals should be per-player (client will select)
+function gameView(game, viewerPlayerId){
+  // Player-specific view to preserve secrecy (audit pending actions, intel, etc.)
+  const pid = viewerPlayerId;
+  const settleEntries = {};
+  for(const p of game.players){
+    const e = game.settle?.entries?.[p.playerId] || null;
+    if(!e){ continue; }
+    if(p.playerId===pid){
+      settleEntries[p.playerId] = e;
+    }else{
+      settleEntries[p.playerId] = { started: !!e.started, paid: !!e.paid, finalUsd: null, finalBreakdown: null };
+    }
+  }
+  const settlePending = pid ? (game.settle?.pending?.[pid] || { lawyer:null, lobby:[] }) : { lawyer:null, lobby:[] };
+
   return {
     gameId: game.gameId,
     status: game.status,
@@ -301,12 +330,20 @@ function gamePublic(game){
     },
     biz: game.biz,
     crypto: game.crypto,
-    settle: game.settle
+    settle: {
+      stage: game.settle?.stage || "PREVIEW",
+      entries: settleEntries,
+      pending: { [pid]: settlePending }
+    }
   };
 }
 
 function broadcast(game){
-  io.to(`game:${game.gameId}`).emit("game_state", gamePublic(game));
+  // Send a player-specific game view to each connected socket
+  for(const [sid, b] of socketBindings.entries()){
+    if(b?.gameId!==game.gameId) continue;
+    io.to(sid).emit("game_state", gameView(game, b.playerId));
+  }
 }
 
 function ackOk(cb, payload){ if(typeof cb==="function") cb({ ok:true, ...(payload||{}) }); }
@@ -414,8 +451,9 @@ function resetStepData(game){
   game.biz.move = {};
   game.biz.auction = { entries:{}, lobbyistPhaseActive:false };
   game.biz.acquire = { entries:{} };
-  game.settle.effects = [];
+  game.settle.stage = "PREVIEW";
   game.settle.entries = {};
+  game.settle.pending = {};
   game.crypto.entries = {};
   // market locks persist within year, but we rebuild for move step
   game.biz.marketLocks = Object.fromEntries(CATALOG.markets.map(m=>[m.marketId, null]));
@@ -439,54 +477,56 @@ function startNewYear(game){
 }
 
 function calcSettlementFor(game, playerId){
-  // Deterministic settlement (test):
-  // - base USD from investments (may be modified by global trends at AUDIT)
-  // - electricity costs from mining farms (may be modified by global trends)
-  // - expert effects (steal base production)
+  // Backwards compatible wrapper used by some legacy UI paths.
+  // Uses the new auditPreview logic and includes player's own BLOCK_TREND choice if already set.
+  const pending = game.settle?.pending?.[playerId];
+  const blockedTrendKey = (pending?.lawyer && pending.lawyer.mode==="BLOCK_TREND") ? pending.lawyer.trendKey : null;
+  const { usd, breakdown } = (function(){
+    // auditPreview is defined inside the socket handler scope; this wrapper should not be relied upon.
+    // Keep minimal safe output.
+    const inv = game.inventory[playerId] || blankInventory();
+    const y = game.year || 1;
+    const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+    const hasTrend = (k)=> globals.some(t=>t.key===k);
+    const isBlocked = (k)=> blockedTrendKey && blockedTrendKey===k;
 
-  const inv = game.inventory[playerId] || blankInventory();
-
-  const y = game.year || 1;
-  const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
-
-  const protectedMap = (game.lawyer?.protections?.[playerId]?.[String(y)]) || {};
-  const protectedSet = new Set(Object.keys(protectedMap));
-  const hasTrend = (key)=> globals.some(t=>t.key===key);
-  const isProtected = (key)=> protectedSet.has(key);
-
-  // Base production
-  let base = inv.investments.reduce((s,c)=>s + Number(c.usdProduction||0), 0);
-
-  // Global trend modifiers for AUDIT (only if trend applies and player not protected)
-  if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isProtected("ECONOMIC_CRISIS_NO_TRAD_BASE")) base = 0;
-  if(hasTrend("TRAD_INV_DOUBLE_USD")) base = base * 2; // positive trend (no lawyer)
-
-  // Electricity costs
-  let electricity = inv.miningFarms.reduce((s,c)=>s + Number(c.electricityUSD||0), 0);
-  if(hasTrend("EXPENSIVE_ELECTRICITY") && !isProtected("EXPENSIVE_ELECTRICITY")) electricity = electricity * 2;
-
-  // Build breakdown
-  const breakdown = [];
-  breakdown.push({ label:"Základní produkce (investice)", usd: base });
-  if(electricity){ breakdown.push({ label:"Elektřina (mining)", usd: -electricity }); }
-
-  // Expert effects (steal base prod)
-  let effectsDelta = 0;
-  for(const e of (game.settle.effects||[])){
-    if(e.type==="STEAL_BASE_PRODUCTION"){
-      if(e.toPlayerId===playerId){
-        effectsDelta += e.usd;
-        breakdown.push({ label:`Krádež produkce (${e.cardId})`, usd: +e.usd });
+    const tradCards = inv.investments || [];
+    const tradBase = tradCards.reduce((s,c)=> s + (Number(c.usdProduction||0) * USD_UNIT), 0);
+    let regionBonus = 0;
+    let globalBonus = 0;
+    const antiMono = hasTrend("ANTIMONOPOLY_NO_BONUSES") && !isBlocked("ANTIMONOPOLY_NO_BONUSES");
+    if(!antiMono){
+      const byCont = {};
+      const byType = {};
+      for(const c of tradCards){
+        byCont[c.continent||""] = (byCont[c.continent||""]||0) + 1;
+        byType[c.type||""] = (byType[c.type||""]||0) + 1;
       }
-      if(e.fromPlayerId===playerId){
-        effectsDelta -= e.usd;
-        breakdown.push({ label:`Ztráta produkce (${e.cardId})`, usd: -e.usd });
-      }
+      for(const n of Object.values(byCont)) regionBonus += bonusForCount(n);
+      for(const n of Object.values(byType)) globalBonus += bonusForCount(n);
     }
-  }
+    let tradBaseAdj = tradBase;
+    if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isBlocked("ECONOMIC_CRISIS_NO_TRAD_BASE")) tradBaseAdj = 0;
+    if(hasTrend("TRAD_INV_DOUBLE_USD")) tradBaseAdj = tradBaseAdj * 2;
 
-  const settlementUsd = base - electricity + effectsDelta;
-  return { settlementUsd, breakdown };
+    const farms = inv.miningFarms || [];
+    const units = { BTC:0, ETH:0, LTC:0, SIA:0 };
+    for(const f of farms){ if(units[f.crypto]!=null) units[f.crypto] += Number(f.cryptoProduction||0); }
+    if(hasTrend("LOWER_DIFFICULTY")) for(const k of Object.keys(units)) units[k] *= 2;
+    let miningValueUsd = 0;
+    for(const k of Object.keys(units)) miningValueUsd += units[k] * Number(game.crypto?.rates?.[k]||0);
+    let electricity = farms.reduce((s,f)=> s + Number(f.electricityUSD||0), 0);
+    if(hasTrend("EXPENSIVE_ELECTRICITY") && !isBlocked("EXPENSIVE_ELECTRICITY")) electricity *= 2;
+
+    const breakdown = [];
+    breakdown.push({ label:"Tradiční investice – základ", usd: tradBaseAdj });
+    if(regionBonus) breakdown.push({ label:"Regionální bonusy", usd: regionBonus });
+    if(globalBonus) breakdown.push({ label:"Globální bonusy", usd: globalBonus });
+    if(miningValueUsd) breakdown.push({ label:"Mining – hodnota produkce", usd: miningValueUsd });
+    if(electricity) breakdown.push({ label:"Elektřina (mining)", usd: -electricity });
+    return { usd: tradBaseAdj + regionBonus + globalBonus + miningValueUsd - electricity, breakdown };
+  })();
+  return { settlementUsd: usd, breakdown };
 }
 
 
@@ -512,7 +552,7 @@ function canBack(game){
     return !Object.values(game.crypto.entries).some(v=>v?.committed);
   }
   if(game.phase==="SETTLE"){
-    return !Object.values(game.settle.entries).some(v=>v?.committed);
+    return !Object.values(game.settle.entries).some(v=>v?.started || v?.paid);
   }
   return false;
 }
@@ -643,7 +683,7 @@ io.on("connection", (socket) => {
         connected: !!p.connected
       }))
     });
-    io.to(socket.id).emit("game_state", gamePublic(game));
+    io.to(socket.id).emit("game_state", gameView(game, playerId));
   });
 
   socket.on("watch_game", (payload, cb) => {
@@ -658,7 +698,7 @@ io.on("connection", (socket) => {
 
     socket.join(`game:${gameId}`);
     ackOk(cb);
-    io.to(socket.id).emit("game_state", gamePublic(game));
+    io.to(socket.id).emit("game_state", gameView(game, playerId));
   });
 
   socket.on("start_game", (payload, cb) => {
@@ -1046,59 +1086,325 @@ io.on("connection", (socket) => {
     broadcast(game);
   });
 
-  // Apply expert effect (steal base production for this year)
+  // =========================
+  // AUDIT (SETTLE) – secret pending actions + start + final + pay
+  // =========================
+
+  function ensureSettlePlayer(game, pid){
+    if(!game.settle.entries[pid]) game.settle.entries[pid] = { started:false, finalUsd:null, finalBreakdown:null, paid:false };
+    if(!game.settle.pending[pid]) game.settle.pending[pid] = { lawyer:null, lobby:[] };
+  }
+
+  function countAvailableExperts(inv, functionKey){
+    return (inv?.experts||[]).filter(e=>e.functionKey===functionKey && !e.used).length;
+  }
+
+  function auditPreview(game, pid, opts){
+    const inv = game.inventory[pid] || blankInventory();
+    const y = game.year || 1;
+    const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+    const hasTrend = (key)=> globals.some(t=>t.key===key);
+
+    const blockedTrendKey = opts?.blockedTrendKey || null;
+    const isBlocked = (key)=> blockedTrendKey && key===blockedTrendKey;
+
+    // Traditional base (cards are units == 1,000 USD)
+    const tradCards = inv.investments || [];
+    const tradBase = tradCards.reduce((s,c)=> s + (Number(c.usdProduction||0) * USD_UNIT), 0);
+
+    // Bonuses (region + global) unless antimonopoly (can be blocked by lawyer)
+    let regionBonus = 0;
+    let globalBonus = 0;
+    const antiMono = hasTrend("ANTIMONOPOLY_NO_BONUSES") && !isBlocked("ANTIMONOPOLY_NO_BONUSES");
+    if(!antiMono){
+      const byCont = {};
+      const byType = {};
+      for(const c of tradCards){
+        const cont = c.continent || "";
+        const typ = c.type || "";
+        byCont[cont] = (byCont[cont]||0) + 1;
+        byType[typ] = (byType[typ]||0) + 1;
+      }
+      for(const n of Object.values(byCont)) regionBonus += bonusForCount(n);
+      for(const n of Object.values(byType)) globalBonus += bonusForCount(n);
+    }
+
+    // Trend modifiers to traditional base (base only)
+    let tradBaseAdj = tradBase;
+    if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isBlocked("ECONOMIC_CRISIS_NO_TRAD_BASE")) tradBaseAdj = 0;
+    if(hasTrend("TRAD_INV_DOUBLE_USD")) tradBaseAdj = tradBaseAdj * 2;
+
+    // Mining production value (per farms) – uses current rates already modified by crypto trend
+    const farms = inv.miningFarms || [];
+    const miningUnits = { BTC:0, ETH:0, LTC:0, SIA:0 };
+    for(const f of farms){
+      const sym = f.crypto;
+      if(miningUnits[sym]==null) continue;
+      miningUnits[sym] += Number(f.cryptoProduction||0);
+    }
+    if(hasTrend("LOWER_DIFFICULTY")){
+      for(const sym of Object.keys(miningUnits)) miningUnits[sym] = miningUnits[sym] * 2;
+    }
+    let miningValueUsd = 0;
+    for(const sym of Object.keys(miningUnits)){
+      const rate = Number(game.crypto?.rates?.[sym]||0);
+      miningValueUsd += miningUnits[sym] * rate;
+    }
+
+    // Electricity costs (per farms)
+    let electricity = farms.reduce((s,f)=> s + Number(f.electricityUSD||0), 0);
+    if(hasTrend("EXPENSIVE_ELECTRICITY") && !isBlocked("EXPENSIVE_ELECTRICITY")) electricity = electricity * 2;
+
+    const breakdown = [];
+    breakdown.push({ label:"Tradiční investice – základ", usd: tradBaseAdj });
+    if(regionBonus) breakdown.push({ label:"Regionální bonusy", usd: regionBonus });
+    if(globalBonus) breakdown.push({ label:"Globální bonusy", usd: globalBonus });
+    if(miningValueUsd) breakdown.push({ label:"Mining – hodnota produkce", usd: miningValueUsd });
+    if(electricity) breakdown.push({ label:"Elektřina (mining)", usd: -electricity });
+    if(antiMono) breakdown.push({ label:"Trend: Antimonopolní úřad (bonusy 0)", usd: 0 });
+    if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isBlocked("ECONOMIC_CRISIS_NO_TRAD_BASE")) breakdown.push({ label:"Trend: Hospodářská krize (základ 0)", usd: 0 });
+    if(hasTrend("TRAD_INV_DOUBLE_USD")) breakdown.push({ label:"Trend: Mimořádné zisky (základ ×2)", usd: 0 });
+    if(hasTrend("LOWER_DIFFICULTY")) breakdown.push({ label:"Trend: Nižší difficulty (mining ×2)", usd: 0 });
+    if(hasTrend("EXPENSIVE_ELECTRICITY") && !isBlocked("EXPENSIVE_ELECTRICITY")) breakdown.push({ label:"Trend: Drahá elektřina (×2)", usd: 0 });
+    if(blockedTrendKey) breakdown.push({ label:"Právník: blokuje trend", usd: 0, meta:{ trendKey: blockedTrendKey } });
+
+    const usd = tradBaseAdj + regionBonus + globalBonus + miningValueUsd - electricity;
+    // max base card (for STEAL damage), unmodified by trends/bonuses
+    const maxTradBaseCardUsd = tradCards.reduce((m,c)=> Math.max(m, Number(c.usdProduction||0) * USD_UNIT), 0);
+    return { usd, breakdown, maxTradBaseCardUsd };
+  }
+
+  function computeAuditFinalForAll(game){
+    const pids = game.players.map(p=>p.playerId);
+    const base = {};
+    for(const pid of pids){
+      ensureSettlePlayer(game, pid);
+      const pending = game.settle.pending[pid] || { lawyer:null, lobby:[] };
+      const blockedTrendKey = (pending.lawyer && pending.lawyer.mode==="BLOCK_TREND") ? pending.lawyer.trendKey : null;
+      base[pid] = auditPreview(game, pid, { blockedTrendKey });
+    }
+
+    // Collect all lobby attacks
+    const attacksByTarget = {};
+    for(const fromPid of pids){
+      const pend = game.settle.pending[fromPid];
+      for(const a of (pend?.lobby||[])){
+        if(!a?.targetPid || !a?.type) continue;
+        const t = a.targetPid;
+        if(!attacksByTarget[t]) attacksByTarget[t] = [];
+        attacksByTarget[t].push({ fromPid, type:a.type });
+      }
+    }
+
+    // Determine lawyer shield blocks (one biggest harm)
+    const blockedAttack = {}; // targetPid -> index of blocked attack in attacksByTarget[target]
+    for(const targetPid of pids){
+      const pend = game.settle.pending[targetPid];
+      if(!(pend?.lawyer && pend.lawyer.mode==="SHIELD_LOBBY")) continue;
+      const list = attacksByTarget[targetPid] || [];
+      if(!list.length) continue;
+      const baseUsd = Number(base[targetPid].usd||0);
+      let bestIdx = -1;
+      let bestDmg = -1;
+      for(let i=0;i<list.length;i++){
+        const at = list[i];
+        let dmg = 0;
+        if(at.type==="STEAL") dmg = Number(base[targetPid].maxTradBaseCardUsd||0);
+        else if(at.type==="SABOTAGE") dmg = Math.abs(baseUsd - Math.floor(baseUsd*0.5));
+        if(dmg > bestDmg){ bestDmg = dmg; bestIdx = i; }
+      }
+      if(bestIdx>=0) blockedAttack[targetPid] = bestIdx;
+    }
+
+    // Start from base results
+    const finalUsd = Object.fromEntries(pids.map(pid=>[pid, Number(base[pid].usd||0)]));
+    const breakdown = Object.fromEntries(pids.map(pid=>[pid, [...(base[pid].breakdown||[])] ]));
+
+    // Apply STEAL then SABOTAGE (skip blocked)
+    for(const targetPid of pids){
+      const list = attacksByTarget[targetPid] || [];
+      for(let i=0;i<list.length;i++){
+        const at = list[i];
+        if(blockedAttack[targetPid]===i){
+          breakdown[targetPid].push({ label:`Právník: zablokoval lobbistu (${at.type==="STEAL"?"krádež":"sabotáž"})`, usd: 0 });
+          continue;
+        }
+        if(at.type!=="STEAL") continue;
+        const x = Number(base[targetPid].maxTradBaseCardUsd||0);
+        if(x<=0) continue;
+        finalUsd[targetPid] -= x;
+        finalUsd[at.fromPid] += x;
+        breakdown[targetPid].push({ label:`Lobbista (krádež)`, usd: -x, meta:{ from: at.fromPid } });
+        breakdown[at.fromPid].push({ label:`Lobbista (krádež)`, usd: +x, meta:{ target: targetPid } });
+      }
+    }
+
+    for(const targetPid of pids){
+      const list = attacksByTarget[targetPid] || [];
+      for(let i=0;i<list.length;i++){
+        const at = list[i];
+        if(blockedAttack[targetPid]===i) continue;
+        if(at.type!=="SABOTAGE") continue;
+        const before = finalUsd[targetPid];
+        const after = Math.floor(before * 0.5);
+        finalUsd[targetPid] = after;
+        breakdown[targetPid].push({ label:`Lobbista (sabotáž −50 %)`, usd: after-before, meta:{ from: at.fromPid } });
+      }
+    }
+
+    // Store per player
+    for(const pid of pids){
+      ensureSettlePlayer(game, pid);
+      game.settle.entries[pid].finalUsd = finalUsd[pid];
+      game.settle.entries[pid].finalBreakdown = breakdown[pid];
+    }
+    game.settle.stage = "FINAL";
+  }
+
+  // Legacy event: expert effects are now handled via pending actions.
   socket.on("apply_expert_effect", (payload, cb) => {
-    const { gameId, playerId, effect } = payload || {};
+    return ackErr(cb, "Expert akce jsou nově v Auditu tajné a nastavují se v Předběžném auditu.", "LEGACY");
+  });
+
+  socket.on("audit_set_pending_lawyer", (payload, cb) => {
+    const { gameId, playerId, lawyer } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
     if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+    ensureSettlePlayer(game, playerId);
+    const entry = game.settle.entries[playerId];
+    if(entry.started) return ackErr(cb, "Audit už byl zahájen.", "LOCKED");
 
-    const type = effect?.type;
-    if(type!=="STEAL_BASE_PRODUCTION") return ackErr(cb, "Unsupported effect", "BAD_INPUT");
-    const targetPlayerId = effect?.targetPlayerId;
-    const cardId = effect?.cardId;
-
+    // Validate lawyer availability (functionKey LAWYER_TRENDS)
     const inv = game.inventory[playerId] || blankInventory();
-    const has = inv.experts.some(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
-    if(!has) return ackErr(cb, "Nemáš lobbistu (krádež).", "NO_POWER");
+    const hasLawyer = countAvailableExperts(inv, "LAWYER_TRENDS") > 0;
+    if(lawyer && !hasLawyer) return ackErr(cb, "Nemáš právníka.", "NO_POWER");
 
-    // Card must belong to target (ownership does not change)
-    const targetInv = game.inventory[targetPlayerId] || blankInventory();
-    const card = targetInv.investments.find(c=>c.cardId===cardId);
-    if(!card) return ackErr(cb, "Cíl nevlastní tuto investici.", "BAD_INPUT");
-
-    const usd = Number(card.usdProduction||0);
-
-    // consume expert
-    const ex = inv.experts.find(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
-    ex.used=true;
-
-    game.settle.effects.push({ type:"STEAL_BASE_PRODUCTION", fromPlayerId: targetPlayerId, toPlayerId: playerId, cardId, usd });
-
-    // If some players already started audit, update their computed settlements so UI can show "Finální audit".
-    try{
-      for(const p of game.players){
-        const pid = p.playerId;
-        if(game.settle.entries?.[pid]?.committed){
-          const { settlementUsd, breakdown } = calcSettlementFor(game, pid);
-          game.settle.entries[pid] = { ...game.settle.entries[pid], settlementUsd, breakdown };
-        }
-      }
-    }catch(e){}
+    // Validate payload
+    let next = null;
+    if(lawyer && lawyer.mode==="BLOCK_TREND"){
+      const trendKey = String(lawyer.trendKey||"").trim();
+      if(!trendKey) return ackErr(cb, "Chybí trend.", "BAD_INPUT");
+      // Lawyer can only block trends explicitly marked as allowed and currently active this year
+      const y = game.year || 1;
+      const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+      const t = globals.find(x=>x && x.key===trendKey);
+      if(!t) return ackErr(cb, "Trend není aktivní.", "BAD_INPUT");
+      if(!t.lawyer?.allowed) return ackErr(cb, "Tento trend nelze blokovat právníkem.", "BAD_INPUT");
+      next = { mode:"BLOCK_TREND", trendKey };
+    } else if(lawyer && lawyer.mode==="SHIELD_LOBBY"){
+      next = { mode:"SHIELD_LOBBY" };
+    } else {
+      next = null;
+    }
+    game.settle.pending[playerId].lawyer = next;
     ackOk(cb);
     broadcast(game);
   });
 
-  // Settlement commit (server computes display settlement)
+  socket.on("audit_add_pending_lobby", (payload, cb) => {
+    const { gameId, playerId, action } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+    ensureSettlePlayer(game, playerId);
+    const entry = game.settle.entries[playerId];
+    if(entry.started) return ackErr(cb, "Audit už byl zahájen.", "LOCKED");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const available = countAvailableExperts(inv, "STEAL_BASE_PROD");
+    const current = game.settle.pending[playerId].lobby.length;
+    if(current >= available) return ackErr(cb, "Nemáš dalšího lobbistu.", "NO_POWER");
+
+    const type = String(action?.type||"").toUpperCase();
+    if(type!=="STEAL" && type!=="SABOTAGE") return ackErr(cb, "Neplatný typ.", "BAD_INPUT");
+    const targetPid = String(action?.targetPid||"").trim();
+    if(!targetPid || !game.players.some(p=>p.playerId===targetPid)) return ackErr(cb, "Neplatný cíl.", "BAD_INPUT");
+    if(targetPid===playerId) return ackErr(cb, "Nemůžeš cílit sám na sebe.", "BAD_INPUT");
+
+    game.settle.pending[playerId].lobby.push({ type, targetPid });
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  socket.on("audit_remove_pending_lobby", (payload, cb) => {
+    const { gameId, playerId, index } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+    ensureSettlePlayer(game, playerId);
+    const entry = game.settle.entries[playerId];
+    if(entry.started) return ackErr(cb, "Audit už byl zahájen.", "LOCKED");
+    const i = Number(index);
+    if(!Number.isInteger(i)) return ackErr(cb, "Bad index", "BAD_INPUT");
+    game.settle.pending[playerId].lobby.splice(i,1);
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Legacy event name kept for compatibility with existing UI: "commit_settlement_ready" == "audit_start"
   socket.on("commit_settlement_ready", (payload, cb) => {
     const { gameId, playerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
     if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
 
-    const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
-    game.settle.entries[playerId] = { settlementUsd, breakdown, committed:true, ts: now() };
-    ackOk(cb, { settlementUsd });
+    ensureSettlePlayer(game, playerId);
+    const entry = game.settle.entries[playerId];
+    if(entry.started) return ackOk(cb);
+
+    // Consume selected experts on start (but keep actions secret)
+    const inv = game.inventory[playerId] || blankInventory();
+    const pend = game.settle.pending[playerId] || { lawyer:null, lobby:[] };
+
+    // Validate pending lawyer BLOCK_TREND (must be active this year and allowed)
+    if(pend.lawyer && pend.lawyer.mode==="BLOCK_TREND"){
+      const y = game.year || 1;
+      const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+      const t = globals.find(x=>x && x.key===pend.lawyer.trendKey);
+      if(!t) return ackErr(cb, "Trend není aktivní.", "BAD_INPUT");
+      if(!t.lawyer?.allowed) return ackErr(cb, "Tento trend nelze blokovat právníkem.", "BAD_INPUT");
+    }
+
+
+    if(pend.lawyer){
+      const ex = inv.experts.find(e=>e.functionKey==="LAWYER_TRENDS" && !e.used);
+      if(!ex) return ackErr(cb, "Nemáš právníka.", "NO_POWER");
+      ex.used = true;
+    }
+    if((pend.lobby||[]).length){
+      for(let k=0;k<pend.lobby.length;k++){
+        const ex = inv.experts.find(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
+        if(!ex) return ackErr(cb, "Nemáš dost lobbistů.", "NO_POWER");
+        ex.used = true;
+      }
+    }
+    game.inventory[playerId] = inv;
+
+    entry.started = true;
+    entry.paid = false;
+    ackOk(cb);
+
+    // If all started -> compute final for all
+    const allStarted = game.players.every(p=>game.settle.entries?.[p.playerId]?.started);
+    if(allStarted){
+      computeAuditFinalForAll(game);
+    }
+    broadcast(game);
+  });
+
+  socket.on("audit_pay", (payload, cb) => {
+    const { gameId, playerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+    ensureSettlePlayer(game, playerId);
+    const entry = game.settle.entries[playerId];
+    if(!entry.started) return ackErr(cb, "Nejdřív zahaj audit.", "BAD_STATE");
+    if(game.settle.stage!=="FINAL") return ackErr(cb, "Čekám na ostatní hráče…", "WAIT");
+    entry.paid = true;
+    game.settle.stage = game.players.every(p=>game.settle.entries?.[p.playerId]?.paid) ? "PAID" : game.settle.stage;
+    ackOk(cb, { amountUsd: entry.finalUsd ?? 0 });
     broadcast(game);
   });
 
@@ -1110,8 +1416,11 @@ io.on("connection", (socket) => {
       if(!game) return ackErr(cb, "Hra neexistuje.");
       const p = game.players.find(x=>x.playerId===playerId);
       if(!p) return ackErr(cb, "Neplatný hráč.");
-      const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
-      return ackOk(cb, { settlementUsd, breakdown });
+      ensureSettlePlayer(game, playerId);
+      const pending = game.settle.pending[playerId] || { lawyer:null, lobby:[] };
+      const blockedTrendKey = (pending.lawyer && pending.lawyer.mode==="BLOCK_TREND") ? pending.lawyer.trendKey : null;
+      const { usd, breakdown } = auditPreview(game, playerId, { blockedTrendKey });
+      return ackOk(cb, { settlementUsd: usd, breakdown });
     }catch(e){
       return ackErr(cb, "Chyba preview auditu.");
     }
