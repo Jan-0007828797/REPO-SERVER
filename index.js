@@ -40,19 +40,7 @@ const markets12 = Array.from({length:12}, (_,i)=>`M${String(i+1).padStart(2,"0")
 
 // Simple catalog (test) – cards are identified by QR payload == cardId
 const CATALOG = (() => {
-  const types = ["AGRO","INDUSTRY","MINING","ENERGY","TECH","LOGISTICS"];
-  const investments = Array.from({length:48}, (_,i)=>{
-    const n=i+1;
-    return {
-      cardId:`TI${String(n).padStart(3,"0")}`,
-      kind:"INVESTMENT",
-      name:`Tradiční investice ${n}`,
-      continent: continents[i % continents.length],
-      market: markets12[i % markets12.length],
-      type: types[i % types.length],
-      usdProduction: 2 + (n % 7)
-    };
-  });
+  const investments = loadTraditionalInvestments().map(c=>({ ...c, kind:"INVESTMENT" }));
   // Mining farms (spec-aligned): production in units (ks) per year, electricity is USD cost per year.
   // MF001 BTC 3, MF002 ETH 6, MF003 LTC 12, MF004 SIA 24; electricity 12,000 USD each.
   const miningFarms = [
@@ -106,6 +94,28 @@ function loadCryptoTrends(){
     { key:"CRYPTO_TREND_1", name:"Kryptotrend 1", coeff:{ BTC:1, ETH:1, LTC:1, SIA:1 } }
   ];
 }
+
+function loadTraditionalInvestments(){
+  try{
+    const p = path.join(__dirname, "data", "traditionalInvestments.json");
+    const raw = fs.readFileSync(p, "utf-8");
+    const arr = JSON.parse(raw);
+    if(Array.isArray(arr) && arr.length===48) return arr;
+  }catch(e){}
+  // Fallback: allow only TI001..TI048 with minimal info (should not happen)
+  return Array.from({length:48}, (_,i)=>({
+    cardId:`TI${String(i+1).padStart(3,"0")}`,
+    kind:"INVESTMENT",
+    name:`Tradiční investice TI${String(i+1).padStart(3,"0")}`,
+    continent: continents[i % continents.length],
+    type: "INDUSTRY",
+    code: "",
+    color: "BLUE",
+    usdProduction: 5,
+    auctionStartUsd: 5000
+  }));
+}
+
 
 // Trends pool (minimal for test)
   const globalTrends = loadGlobalTrends();
