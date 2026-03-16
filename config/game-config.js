@@ -1,0 +1,15 @@
+module.exports = {
+  PHASES: {
+    BIZ: 'BIZ',
+    CRYPTO: 'CRYPTO',
+    SETTLE: 'SETTLE',
+  },
+  BIZ_STEPS: {
+    ML_BID: 'ML_BID',
+    MOVE: 'MOVE',
+    AUCTION_ENVELOPE: 'AUCTION_ENVELOPE',
+    ACQUIRE: 'ACQUIRE',
+  },
+  CRYPTO_COINS: ['BTC','ETH','LTC','SIA'],
+  CONTINENTS: ['EUROPE','ASIA','AFRICA','N_AMERICA','S_AMERICA','OCEANIA'],
+};

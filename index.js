@@ -5,6 +5,10 @@ const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
 const fs = require("fs");
 const path = require("path");
+const { PHASES, BIZ_STEPS, CRYPTO_COINS } = require("./config/game-config");
+const { nextPhaseState, previousPhaseState, currentPhaseKey } = require("./engine/phase-machine");
+const { ensureActionRegistry, markCommitted, resetCurrentPhaseActions } = require("./engine/action-registry");
+const { issueReconnectToken, bindSocketToPlayer, unbindSocket, resolveSocketPlayerId, attachReconnectToken, getReconnectToken, findPlayerIdByReconnectToken } = require("./session/player-session");
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -157,12 +161,42 @@ function loadCryptoTrends(){
   const cryptoTrends = loadCryptoTrends();
 
 
-  const markets = markets12.map((m, idx)=>({
-    marketId: m,
-    label: `Trh ${idx+1}`,
-    continent: continents[idx % continents.length],
-    type: ["AGRO","INDUSTRY","MINING","ENERGY","TECH","LOGISTICS"][idx % 6]
-  }));
+  const markets = [];
+  // Variant A: 6 continents × 2 markets (Bible mapping)
+  const CONTINENT_MARKET_TYPES = {
+    N_AMERICA: ["INDUSTRY","MINING"],
+    S_AMERICA: ["MINING","AGRO"],
+    EUROPE: ["INDUSTRY","AGRO"],
+    AFRICA: ["MINING","AGRO"],
+    ASIA: ["INDUSTRY","MINING"],
+    OCEANIA: ["INDUSTRY","AGRO"],
+  };
+  const mkMarketId = (continent, type) => `${continent}_${type}`;
+
+  for (const continent of continents){
+    const types = CONTINENT_MARKET_TYPES[continent] || [];
+    for (const type of types){
+      markets.push({
+        marketId: mkMarketId(continent, type),
+        name: `${continent} ${type}`,
+        continent,
+        type, // "INDUSTRY" | "MINING" | "AGRO"
+        kind: "MARKET",
+      });
+    }
+  }
+
+  // 3 mining farm board slots (not on a continent)
+  for (let i=1;i<=3;i++){
+    markets.push({
+      marketId: `FARM_${i}`,
+      name: `Farma ${i}`,
+      continent: null,
+      type: "FARM",
+      kind: "FARM",
+      slot: i,
+    });
+  }
 
   return { investments, miningFarms, experts, globalTrends, regionalTrends, cryptoTrends, continents, markets };
 })();
@@ -193,7 +227,8 @@ function makePlayer(name, role, seatIndex){
     connected: false,
     joinedAt: now(),
     marketId: null,
-    wallet: { usd: 0, crypto: { BTC:3, ETH:3, LTC:3, SIA:3 } }
+    wallet: { usd: 0, crypto: { BTC:3, ETH:3, LTC:3, SIA:3 } },
+    reconnectToken: issueReconnectToken()
   };
 }
 
@@ -267,11 +302,16 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
     settle: {
       entries: {},  // pid -> { settlementUsd:number, committed:boolean, breakdown:[{label,usd}] }
       effects: []   // applied expert effects for this year
-    }
+    },
+
+    reconnectTokens: {},
+    phaseActions: {}
   };
 
   // init reveal state
   game.reveals[gm.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
+  attachReconnectToken(game, gm.playerId, gm.reconnectToken);
+  ensureActionRegistry(game);
 
   games.set(gameId, game);
   return { game, gm };
@@ -301,7 +341,8 @@ function gamePublic(game){
     },
     biz: game.biz,
     crypto: game.crypto,
-    settle: game.settle
+    settle: game.settle,
+    meta: { currentPhaseKey: currentPhaseKey(game) }
   };
 }
 
@@ -322,6 +363,21 @@ function getPlayer(game, playerId){
 function isGM(game, playerId){
   const p = getPlayer(game, playerId);
   return p && p.role==="GM";
+}
+
+function resolveActorPlayerId(socket, game, payloadPlayerId){
+  const bound = resolveSocketPlayerId(socketBindings, socket.id, game?.gameId);
+  if(bound && getPlayer(game, bound)) return bound;
+  if(payloadPlayerId && getPlayer(game, payloadPlayerId)) return payloadPlayerId;
+  return null;
+}
+
+function bindPresence(socket, game, playerId){
+  const p = getPlayer(game, playerId);
+  if(!p) return null;
+  p.connected = true;
+  bindSocketToPlayer(socketBindings, socket.id, game.gameId, p.playerId);
+  return p;
 }
 
 function currentYearCrypto(game){
@@ -421,12 +477,25 @@ function resetStepData(game){
   game.biz.marketLocks = Object.fromEntries(CATALOG.markets.map(m=>[m.marketId, null]));
 }
 
+function rebuildMarketLocksFromPositions(game){
+  // Start from empty lock map, then lock current player positions.
+  game.biz.marketLocks = Object.fromEntries(CATALOG.markets.map(m=>[m.marketId, null]));
+  for(const p of game.players){
+    const mid = p.marketId;
+    if(mid && (mid in game.biz.marketLocks)){
+      game.biz.marketLocks[mid] = p.playerId;
+    }
+  }
+}
+
 function startNewYear(game){
+  resetCurrentPhaseActions(game);
   game.year += 1;
   game.phase = "BIZ";
   // Trends are activated automatically at year start; players view them in ML intro modal.
   game.bizStep = "ML_BID";
   resetStepData(game);
+  rebuildMarketLocksFromPositions(game);
 
   // Apply trend triggers at the moment the year starts (previously happened in the removed "TRENDS" step)
   applyTrendTriggers_OnTrendsToML(game);
@@ -472,6 +541,7 @@ function calcSettlementFor(game, playerId){
 
   // Expert effects (steal base prod)
   let effectsDelta = 0;
+  const lobbyistImpacts = [];
   for(const e of (game.settle.effects||[])){
     if(e.type==="STEAL_BASE_PRODUCTION"){
       if(e.toPlayerId===playerId){
@@ -483,10 +553,62 @@ function calcSettlementFor(game, playerId){
         breakdown.push({ label:`Ztráta produkce (${e.cardId})`, usd: -e.usd });
       }
     }
+
+    // Audit lobbyist effects (V33): sabotage/steal
+    if(e.type==="AUDIT_LOBBYIST_STEAL"){
+      if(e.toPlayerId===playerId){
+        effectsDelta += e.usd;
+        breakdown.push({ label:`Lobbista – zloděj (+)`, usd: +e.usd });
+      }
+      if(e.fromPlayerId===playerId){
+        effectsDelta -= e.usd;
+        lobbyistImpacts.push({ usd: -e.usd, label:`Lobbista – zloděj (−)` });
+      }
+    }
+    if(e.type==="AUDIT_LOBBYIST_SABOTAGE"){
+      if(e.targetPlayerId===playerId){
+        lobbyistImpacts.push({ usd: -Math.abs(Number(e.usd||0)), label:`Lobbista – sabotér (−)` });
+        effectsDelta -= Math.abs(Number(e.usd||0));
+      }
+    }
+  }
+
+  // Single-use shield (LAWYER) against the biggest lobbyist impact in this audit.
+  const shieldActive = !!(game.lawyer?.auditShield?.[playerId]?.[String(y)]);
+  if(shieldActive && lobbyistImpacts.length){
+    let worst = lobbyistImpacts[0];
+    for(const x of lobbyistImpacts){
+      if(Number(x.usd) < Number(worst.usd)) worst = x;
+    }
+    const refund = Math.abs(Number(worst.usd||0));
+    if(refund>0){
+      effectsDelta += refund;
+      breakdown.push({ label:`Právník – štít (+)`, usd: +refund });
+    }
   }
 
   const settlementUsd = base - electricity + effectsDelta;
   return { settlementUsd, breakdown };
+}
+
+function roundDownToHundreds(n){
+  const x = Math.floor(Number(n||0));
+  if(!Number.isFinite(x)) return 0;
+  if(x < 100) return 0;
+  return Math.floor(x / 100) * 100;
+}
+
+function sumTradBase(inv){
+  return (inv?.investments||[]).reduce((s,c)=>s + Number(c.usdProduction||0), 0);
+}
+
+function maxTradBase(inv){
+  let m = 0;
+  for(const c of (inv?.investments||[])){
+    const v = Number(c.usdProduction||0);
+    if(v > m) m = v;
+  }
+  return m;
 }
 
 
@@ -518,8 +640,13 @@ function canBack(game){
 }
 
 function gmNext(game){
+  resetCurrentPhaseActions(game);
   if(game.phase==="BIZ"){
-    if(game.bizStep==="ML_BID"){ game.bizStep="MOVE"; return; }
+    if(game.bizStep==="ML_BID"){
+      game.bizStep="MOVE";
+      rebuildMarketLocksFromPositions(game);
+      return;
+    }
     if(game.bizStep==="MOVE"){ game.bizStep="AUCTION_ENVELOPE"; return; }
     if(game.bizStep==="AUCTION_ENVELOPE"){ game.biz.auction.lobbyistPhaseActive = false; game.bizStep="ACQUIRE"; return; }
     if(game.bizStep==="ACQUIRE"){ game.phase="CRYPTO"; game.bizStep=null; return; }
@@ -538,9 +665,10 @@ function gmNext(game){
 }
 
 function gmBack(game){
+  resetCurrentPhaseActions(game);
   if(game.phase==="BIZ"){
     if(game.bizStep==="MOVE"){ game.bizStep="ML_BID"; return; }
-    if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; return; }
+    if(game.bizStep==="AUCTION_ENVELOPE"){ game.bizStep="MOVE"; rebuildMarketLocksFromPositions(game); return; }
     if(game.bizStep==="ACQUIRE"){ game.biz.auction.lobbyistPhaseActive = false; game.bizStep="AUCTION_ENVELOPE"; return; }
   } else if(game.phase==="CRYPTO"){
     game.phase="BIZ"; game.bizStep="ACQUIRE"; return;
@@ -556,10 +684,10 @@ io.on("connection", (socket) => {
       const { name, yearsTotal, maxPlayers } = payload || {};
       const { game, gm } = newGame({ gmName:name, yearsTotal, maxPlayers });
       gm.connected = true;
-      socketBindings.set(socket.id, { gameId: game.gameId, playerId: gm.playerId });
+      bindSocketToPlayer(socketBindings, socket.id, game.gameId, gm.playerId);
       socket.join(`game:${game.gameId}`);
-      ackOk(cb, { gameId: game.gameId, playerId: gm.playerId, role: gm.role });
-      io.to(socket.id).emit("created_game", { gameId: game.gameId, playerId: gm.playerId });
+      ackOk(cb, { gameId: game.gameId, playerId: gm.playerId, role: gm.role, reconnectToken: gm.reconnectToken });
+      io.to(socket.id).emit("created_game", { gameId: game.gameId, playerId: gm.playerId, reconnectToken: gm.reconnectToken });
     }catch(e){
       ackErr(cb, "create_game failed");
     }
@@ -589,22 +717,25 @@ io.on("connection", (socket) => {
     game.reveals[p.playerId] = { globalYearsRevealed: [], cryptoYearsRevealed: [] };
 
     // Bind this socket to the player for presence tracking
-    socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
+    attachReconnectToken(game, p.playerId, p.reconnectToken);
+    bindSocketToPlayer(socketBindings, socket.id, game.gameId, p.playerId);
     socket.join(`game:${game.gameId}`);
 
-    ackOk(cb, { playerId: p.playerId, seatIndex: p.seatIndex });
+    ackOk(cb, { playerId: p.playerId, seatIndex: p.seatIndex, reconnectToken: p.reconnectToken });
     broadcast(game);
   });
 
   socket.on("reconnect_game", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+    const { gameId, playerId, reconnectToken } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Hra nenalezena", "NOT_FOUND");
-    const p = (game.players||[]).find(x => x.playerId===playerId);
+
+    const tokenPid = findPlayerIdByReconnectToken(game, reconnectToken);
+    const resolvedPlayerId = tokenPid || playerId;
+    const p = (game.players||[]).find(x => x.playerId===resolvedPlayerId);
     if(!p) return ackErr(cb, "Profil v této hře nenalezen", "NO_PLAYER");
 
-    p.connected = true;
-    socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId });
+    bindPresence(socket, game, p.playerId);
     socket.join(`game:${game.gameId}`);
 
     ackOk(cb, {
@@ -612,7 +743,8 @@ io.on("connection", (socket) => {
       gameStatus: game.status,
       playerId: p.playerId,
       role: p.role,
-      seatIndex: p.seatIndex
+      seatIndex: p.seatIndex,
+      reconnectToken: getReconnectToken(game, p.playerId) || p.reconnectToken
     });
     broadcast(game);
   });
@@ -627,7 +759,7 @@ io.on("connection", (socket) => {
     // presence
     if(playerId){
       const p = (game.players||[]).find(x=>x.playerId===playerId);
-      if(p){ p.connected = true; socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId }); }
+      if(p){ bindPresence(socket, game, p.playerId); }
     }
 
     socket.join(`game:${gameId}`);
@@ -653,7 +785,7 @@ io.on("connection", (socket) => {
 
     if(playerId){
       const p = (game.players||[]).find(x=>x.playerId===playerId);
-      if(p){ p.connected = true; socketBindings.set(socket.id, { gameId: game.gameId, playerId: p.playerId }); }
+      if(p){ bindPresence(socket, game, p.playerId); }
     }
 
     socket.join(`game:${gameId}`);
@@ -680,9 +812,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("gm_next", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+    const { gameId, playerId: payloadPlayerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
     if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
     gmNext(game);
     ackOk(cb);
@@ -690,9 +823,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("gm_back", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+    const { gameId, playerId: payloadPlayerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
     if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
     if(!canBack(game)) return ackErr(cb, "Nelze vrátit – už proběhly volby.", "GUARD_FAIL");
     gmBack(game);
@@ -757,9 +891,11 @@ io.on("connection", (socket) => {
 
   // Lawyer protection against a specific global trend (per-player, per-year)
   socket.on("use_lawyer_on_trend", (payload, cb) => {
-    const { gameId, playerId, trendKey } = payload || {};
+    const { gameId, playerId: payloadPlayerId, trendKey } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.status!=="IN_PROGRESS") return ackErr(cb, "Bad state", "BAD_STATE");
 
     const y = String(game.year||1);
@@ -789,9 +925,11 @@ io.on("connection", (socket) => {
 
   // Commit ML bid (no winner resolution here)
   socket.on("commit_ml_bid", (payload, cb) => {
-    const { gameId, playerId, amountUsd } = payload || {};
+    const { gameId, playerId: payloadPlayerId, amountUsd } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="BIZ" || game.bizStep!=="ML_BID") return ackErr(cb, "Not ML step", "BAD_STATE");
 
     let val = amountUsd;
@@ -802,15 +940,18 @@ io.on("connection", (socket) => {
       val = Math.floor(val);
     }
     game.biz.mlBids[playerId] = { amountUsd: val, committed:true, ts: now() };
+    markCommitted(game, playerId, { kind: "ML_BID" });
     ackOk(cb);
     broadcast(game);
   });
 
   // Move selection (locks markets)
   socket.on("pick_market", (payload, cb) => {
-    const { gameId, playerId, marketId } = payload || {};
+    const { gameId, playerId: payloadPlayerId, marketId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="BIZ" || game.bizStep!=="MOVE") return ackErr(cb, "Not MOVE step", "BAD_STATE");
     if(game.biz.move[playerId]?.committed) return ackErr(cb, "Already moved", "ALREADY");
 
@@ -824,6 +965,7 @@ io.on("connection", (socket) => {
     game.biz.marketLocks[marketId] = playerId;
     const p = getPlayer(game, playerId); if(p) p.marketId = marketId;
     game.biz.move[playerId] = { marketId, committed:true, ts: now() };
+    markCommitted(game, playerId, { kind: "MOVE", marketId });
 
     ackOk(cb);
     broadcast(game);
@@ -831,9 +973,11 @@ io.on("connection", (socket) => {
 
   // Auction (envelope) bid
   socket.on("commit_auction_bid", (payload, cb) => {
-    const { gameId, playerId, bidUsd, usedLobbyist } = payload || {};
+    const { gameId, playerId: payloadPlayerId, bidUsd, usedLobbyist } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
 
     let val = bidUsd;
@@ -843,6 +987,7 @@ io.on("connection", (socket) => {
       if(!Number.isFinite(val) || val<0) return ackErr(cb, "Invalid bid", "BAD_INPUT");
       val = Math.floor(val);
     }
+    markCommitted(game, playerId, { kind: "AUCTION_ENVELOPE" });
     game.biz.auction.entries[playerId] = {
       bidUsd: val,
       committed:true,
@@ -868,9 +1013,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("gm_open_lobbyist_window", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+    const { gameId, playerId: payloadPlayerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
     if(!isGM(game, playerId)) return ackErr(cb, "Only GM", "FORBIDDEN");
     if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
 
@@ -887,9 +1033,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("commit_auction_final_bid", (payload, cb) => {
-    const { gameId, playerId, finalBidUsd } = payload || {};
+    const { gameId, playerId: payloadPlayerId, finalBidUsd } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="BIZ" || game.bizStep!=="AUCTION_ENVELOPE") return ackErr(cb, "Not AUCTION step", "BAD_STATE");
     if(!game.biz.auction.lobbyistPhaseActive) return ackErr(cb, "No lobbyist window", "BAD_STATE");
 
@@ -905,18 +1053,22 @@ io.on("connection", (socket) => {
 
     entry.finalBidUsd = val;
     entry.finalCommitted = true;
+    markCommitted(game, playerId, { kind: "AUCTION_FINAL" });
     ackOk(cb);
     broadcast(game);
   });
 
   // Acquisition commit (definitive decision for this step)
   socket.on("commit_acquire", (payload, cb) => {
-    const { gameId, playerId, gotCard } = payload || {};
+    const { gameId, playerId: payloadPlayerId, gotCard } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="BIZ" || game.bizStep!=="ACQUIRE") return ackErr(cb, "Not ACQUIRE step", "BAD_STATE");
 
     game.biz.acquire.entries[playerId] = { committed:true, gotCard: !!gotCard, ts: now() };
+    markCommitted(game, playerId, { kind: "ACQUIRE", gotCard: !!gotCard });
     ackOk(cb);
     broadcast(game);
   });
@@ -1028,9 +1180,11 @@ io.on("connection", (socket) => {
 
   // Crypto commit (server computes deltaUsd for display)
   socket.on("commit_crypto", (payload, cb) => {
-    const { gameId, playerId, deltas } = payload || {};
+    const { gameId, playerId: payloadPlayerId, deltas } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
     if(game.phase!=="CRYPTO") return ackErr(cb, "Not CRYPTO phase", "BAD_STATE");
 
     const clean = {};
@@ -1042,6 +1196,7 @@ io.on("connection", (socket) => {
       deltaUsd += -d * Number(game.crypto.rates[sym]||0); // buying positive costs USD (negative delta), selling negative gives USD
     }
     game.crypto.entries[playerId] = { deltas: clean, deltaUsd, committed:true, ts: now() };
+    markCommitted(game, playerId, { kind: "CRYPTO" });
     ackOk(cb, { deltaUsd });
     broadcast(game);
   });
@@ -1089,15 +1244,95 @@ io.on("connection", (socket) => {
     broadcast(game);
   });
 
-  // Settlement commit (server computes display settlement)
-  socket.on("commit_settlement_ready", (payload, cb) => {
-    const { gameId, playerId } = payload || {};
+  // V33: Audit lobbyist actions (sabotage / steal) – consumes one unused STEAL_BASE_PROD expert.
+  socket.on("apply_audit_lobbyist", (payload, cb) => {
+    const { gameId, playerId, action, targetPlayerId } = payload || {};
     const game = getGame(gameId);
     if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
     if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
 
+    const inv = game.inventory[playerId] || blankInventory();
+    const ex = inv.experts.find(e=>e.functionKey==="STEAL_BASE_PROD" && !e.used);
+    if(!ex) return ackErr(cb, "Nemáš lobbistu.", "NO_POWER");
+    const targetInv = game.inventory[targetPlayerId] || blankInventory();
+
+    let usd = 0;
+    if(action==="AUDIT_LOBBYIST_SABOTAGE"){
+      usd = roundDownToHundreds(0.5 * sumTradBase(targetInv));
+      game.settle.effects.push({ type:"AUDIT_LOBBYIST_SABOTAGE", fromPlayerId: playerId, targetPlayerId, usd });
+    } else if(action==="AUDIT_LOBBYIST_STEAL"){
+      usd = roundDownToHundreds(maxTradBase(targetInv));
+      game.settle.effects.push({ type:"AUDIT_LOBBYIST_STEAL", fromPlayerId: targetPlayerId, toPlayerId: playerId, usd });
+    } else {
+      return ackErr(cb, "Bad action", "BAD_INPUT");
+    }
+
+    // consume lobbyist
+    ex.used = true;
+
+    // refresh computed settlements for already committed entries
+    try{
+      for(const p of game.players){
+        const pid = p.playerId;
+        if(game.settle.entries?.[pid]?.committed){
+          const { settlementUsd, breakdown } = calcSettlementFor(game, pid);
+          game.settle.entries[pid] = { ...game.settle.entries[pid], settlementUsd, breakdown };
+        }
+      }
+    }catch(e){}
+
+    ackOk(cb, { usd });
+    broadcast(game);
+  });
+
+  // V33: Activate audit shield (LAWYER) – consumes one unused LAWYER_TRENDS expert.
+  socket.on("activate_audit_shield", (payload, cb) => {
+    const { gameId, playerId: payloadPlayerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const ex = inv.experts.find(e=>e.functionKey==="LAWYER_TRENDS" && !e.used);
+    if(!ex) return ackErr(cb, "Nemáš právníka.", "NO_POWER");
+
+    const y = String(game.year||1);
+    game.lawyer = game.lawyer || {};
+    game.lawyer.auditShield = game.lawyer.auditShield || {};
+    game.lawyer.auditShield[playerId] = game.lawyer.auditShield[playerId] || {};
+    game.lawyer.auditShield[playerId][y] = true;
+
+    ex.used = true;
+
+    // refresh computed settlements for already committed entries
+    try{
+      for(const p of game.players){
+        const pid = p.playerId;
+        if(game.settle.entries?.[pid]?.committed){
+          const { settlementUsd, breakdown } = calcSettlementFor(game, pid);
+          game.settle.entries[pid] = { ...game.settle.entries[pid], settlementUsd, breakdown };
+        }
+      }
+    }catch(e){}
+
+    ackOk(cb);
+    broadcast(game);
+  });
+
+  // Settlement commit (server computes display settlement)
+  socket.on("commit_settlement_ready", (payload, cb) => {
+    const { gameId, playerId: payloadPlayerId } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+
     const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
     game.settle.entries[playerId] = { settlementUsd, breakdown, committed:true, ts: now() };
+    markCommitted(game, playerId, { kind: "SETTLE" });
     ackOk(cb, { settlementUsd });
     broadcast(game);
   });
@@ -1105,9 +1340,10 @@ io.on("connection", (socket) => {
   // Preview audit (no commit) – used by "Předběžný audit" in accounting.
   socket.on("preview_audit", (payload, cb) => {
     try{
-      const { gameId, playerId } = payload || {};
+      const { gameId, playerId: payloadPlayerId } = payload || {};
       const game = games.get(gameId);
       if(!game) return ackErr(cb, "Hra neexistuje.");
+      const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
       const p = game.players.find(x=>x.playerId===playerId);
       if(!p) return ackErr(cb, "Neplatný hráč.");
       const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
@@ -1119,7 +1355,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
       const b = socketBindings.get(socket.id);
       if(!b) return;
-      socketBindings.delete(socket.id);
+      unbindSocket(socketBindings, socket.id);
       const game = getGame(b.gameId);
       if(!game) return;
       const p = (game.players||[]).find(x=>x.playerId===b.playerId);
