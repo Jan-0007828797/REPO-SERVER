@@ -1,0 +1,6 @@
+[
+  {"cardId":"MF001","kind":"MINING_FARM","name":"Mining farma BTC – velká","slot":1,"crypto":"BTC","cryptoProduction":3,"electricityUSD":12000,"auctionStartUsd":5000},
+  {"cardId":"MF002","kind":"MINING_FARM","name":"Mining farma ETH – velká","slot":2,"crypto":"ETH","cryptoProduction":6,"electricityUSD":12000,"auctionStartUsd":5000},
+  {"cardId":"MF003","kind":"MINING_FARM","name":"Mining farma LTC – velká","slot":3,"crypto":"LTC","cryptoProduction":12,"electricityUSD":12000,"auctionStartUsd":5000},
+  {"cardId":"MF004","kind":"MINING_FARM","name":"Mining farma SIA – velká","slot":1,"crypto":"SIA","cryptoProduction":24,"electricityUSD":12000,"auctionStartUsd":5000}
+]
