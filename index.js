@@ -273,7 +273,8 @@ function newGame({ gmName, yearsTotal, maxPlayers }){
 
     settle: {
       entries: {},  // pid -> { settlementUsd:number, committed:boolean, breakdown:[{label,usd}] }
-      effects: []   // applied expert effects for this year
+      effects: [],  // applied expert effects for this year
+      lawyerPlans: {} // pid -> { immediateUses:number, shieldUses:number, immediateGain:number }
     },
 
     reconnectTokens: {},
@@ -388,21 +389,12 @@ function ensureAuctionRanking(game){
   const rows = (game.players||[]).map(p=>{
     const entry = game.biz?.auction?.entries?.[p.playerId] || {};
     const raw = effectiveAuctionBid(entry);
-    const amountUsd = Number.isFinite(Number(raw)) ? Number(raw) : null;
+    const amountUsd = Number.isFinite(Number(raw)) ? Number(raw) : -1;
     const ts = Number(entry.ts || Number.MAX_SAFE_INTEGER);
     return { playerId:p.playerId, name:p.name, amountUsd, ts };
   });
-  rows.sort((a,b)=>{
-    const aHasBid = Number.isFinite(Number(a.amountUsd));
-    const bHasBid = Number.isFinite(Number(b.amountUsd));
-    if(aHasBid && !bHasBid) return -1;
-    if(!aHasBid && bHasBid) return 1;
-    if(aHasBid && bHasBid){
-      return (Number(b.amountUsd||0)-Number(a.amountUsd||0)) || (a.ts-b.ts) || a.name.localeCompare(b.name);
-    }
-    return a.ts-b.ts || a.name.localeCompare(b.name);
-  });
-  game.biz.auction.ranking = rows.map((r, idx)=>({ rank: idx+1, playerId:r.playerId, name:r.name, amountUsd: Number.isFinite(Number(r.amountUsd)) ? Number(r.amountUsd) : null }));
+  rows.sort((a,b)=> (b.amountUsd-a.amountUsd) || (a.ts-b.ts) || a.name.localeCompare(b.name));
+  game.biz.auction.ranking = rows.map((r, idx)=>({ rank: idx+1, playerId:r.playerId, name:r.name }));
   game.biz.auction.rankingVisible = true;
 }
 
@@ -454,15 +446,8 @@ function autoCommitTimedOutPlayers(game){
 
 function finalizeMlResult(game){
   const players = getActivePlayerIds(game);
-  if(!players.length) return null;
-  const entries = players.map(pid => ({ playerId: pid, ...(game.biz.mlBids[pid]||{}) }));
-  const allCommitted = entries.every(x => !!x.committed);
-  if(!allCommitted) return null;
-  const bids = entries.filter(x => Number.isFinite(Number(x.amountUsd)));
-  if(!bids.length){
-    game.biz.mlResult = { winnerPlayerId: null, amountUsd: null, reason: "NO_BID" };
-    return game.biz.mlResult;
-  }
+  const bids = players.map(pid => ({ playerId: pid, ...(game.biz.mlBids[pid]||{}) })).filter(x => x.committed && Number.isFinite(x.amountUsd));
+  if(!players.length || bids.length!==players.length) return null;
   bids.sort((a,b)=> (Number(b.amountUsd||0)-Number(a.amountUsd||0)) || (Number(a.ts||0)-Number(b.ts||0)));
   const win = bids[0];
   game.biz.mlResult = { winnerPlayerId: win.playerId, amountUsd: Number(win.amountUsd||0), ts: Number(win.ts||0) };
@@ -699,6 +684,7 @@ function resetStepData(game){
   game.biz.acquire = { entries:{} };
   game.settle.effects = [];
   game.settle.entries = {};
+  game.settle.lawyerPlans = {};
   game.crypto.entries = {};
   // market locks persist within year, but we rebuild for move step
   game.biz.marketLocks = Object.fromEntries(CATALOG.markets.map(m=>[m.marketId, null]));
@@ -801,17 +787,24 @@ function calcSettlementFor(game, playerId){
     }
   }
 
-  // Single-use shield (LAWYER) against the biggest lobbyist impact in this audit.
-  const shieldActive = !!(game.lawyer?.auditShield?.[playerId]?.[String(y)]);
-  if(shieldActive && lobbyistImpacts.length){
-    let worst = lobbyistImpacts[0];
-    for(const x of lobbyistImpacts){
-      if(Number(x.usd) < Number(worst.usd)) worst = x;
-    }
-    const refund = Math.abs(Number(worst.usd||0));
+  const lawyerPlan = game.settle?.lawyerPlans?.[playerId] || null;
+  const immediateGain = Number(lawyerPlan?.immediateGain||0);
+  if(immediateGain>0){
+    effectsDelta += immediateGain;
+    breakdown.push({ label:`Právník (+)`, usd: +immediateGain });
+  }
+
+  // Multi-use shield (LAWYER) against the biggest lobbyist impacts in this audit.
+  const legacyShield = game.lawyer?.auditShield?.[playerId]?.[String(y)];
+  const legacyShieldCount = legacyShield===true ? 1 : Math.max(0, Number(legacyShield||0));
+  const shieldUses = Math.max(0, Number(lawyerPlan?.shieldUses||0)) + legacyShieldCount;
+  if(shieldUses>0 && lobbyistImpacts.length){
+    const sorted = [...lobbyistImpacts].sort((a,b)=> Number(a.usd||0) - Number(b.usd||0));
+    const take = sorted.slice(0, shieldUses);
+    const refund = take.reduce((s,x)=> s + Math.abs(Number(x.usd||0)), 0);
     if(refund>0){
       effectsDelta += refund;
-      breakdown.push({ label:`Právník – štít (+)`, usd: +refund });
+      breakdown.push({ label:`Právník – obrana (+)`, usd: +refund });
     }
   }
 
@@ -837,6 +830,71 @@ function maxTradBase(inv){
     if(v > m) m = v;
   }
   return m;
+}
+
+function countUnusedExperts(inv, functionKey){
+  return (inv?.experts||[]).filter(e=>e.functionKey===functionKey && !e.used).length;
+}
+
+function getAuditLawyerImmediateValues(game, playerId){
+  const inv = game.inventory[playerId] || blankInventory();
+  const y = game.year || 1;
+  const globals = (game.trends?.byYear?.[String(y)]?.globals) || [];
+  const protectedMap = (game.lawyer?.protections?.[playerId]?.[String(y)]) || {};
+  const protectedSet = new Set(Object.keys(protectedMap));
+  const hasTrend = (key)=> globals.some(t=>t.key===key);
+  const isProtected = (key)=> protectedSet.has(key);
+
+  const values = [];
+  const base = inv.investments.reduce((s,c)=>s + Number(c.usdProduction||0), 0);
+  const electricityBase = inv.miningFarms.reduce((s,c)=>s + Number(c.electricityUSD||0), 0);
+
+  if(hasTrend("ECONOMIC_CRISIS_NO_TRAD_BASE") && !isProtected("ECONOMIC_CRISIS_NO_TRAD_BASE") && base>0){
+    values.push({ key:"ECONOMIC_CRISIS_NO_TRAD_BASE", label:"Právník – ochrana produkce", usd: base });
+  }
+  if(hasTrend("EXPENSIVE_ELECTRICITY") && !isProtected("EXPENSIVE_ELECTRICITY") && electricityBase>0){
+    values.push({ key:"EXPENSIVE_ELECTRICITY", label:"Právník – drahá elektřina", usd: electricityBase });
+  }
+
+  values.sort((a,b)=> Number(b.usd||0) - Number(a.usd||0));
+  return values;
+}
+
+function getAuditExpertPreview(game, playerId){
+  const inv = game.inventory[playerId] || blankInventory();
+  const lawyerAvailable = countUnusedExperts(inv, "LAWYER_TRENDS");
+  const lobbyistAvailable = countUnusedExperts(inv, "STEAL_BASE_PROD");
+  const lawyerImmediateValues = getAuditLawyerImmediateValues(game, playerId);
+
+  const others = (game.players||[]).filter(p=>p.playerId!==playerId).map(p=>{
+    const targetInv = game.inventory[p.playerId] || blankInventory();
+    return {
+      playerId: p.playerId,
+      playerName: p.name || "Hráč",
+      stealUsd: roundDownToHundreds(maxTradBase(targetInv)),
+      damageUsd: roundDownToHundreds(0.5 * sumTradBase(targetInv)),
+    };
+  });
+
+  const stealTargets = others.filter(x=>x.stealUsd>0).map(x=>({ playerId:x.playerId, playerName:x.playerName, usd:x.stealUsd }));
+  const damageTargets = others.filter(x=>x.damageUsd>0).map(x=>({ playerId:x.playerId, playerName:x.playerName, usd:x.damageUsd }));
+
+  return {
+    lawyer: {
+      available: lawyerAvailable,
+      immediateValues: lawyerImmediateValues,
+      maxImmediateUsd: lawyerImmediateValues.length ? Number(lawyerImmediateValues[0].usd||0) : 0,
+      maxImmediateUses: Math.min(lawyerAvailable, lawyerImmediateValues.length),
+      plan: game.settle?.lawyerPlans?.[playerId] || null,
+    },
+    lobbyist: {
+      available: lobbyistAvailable,
+      stealTargets,
+      damageTargets,
+      maxStealUsd: stealTargets.reduce((m,x)=>Math.max(m, Number(x.usd||0)), 0),
+      maxDamageUsd: damageTargets.reduce((m,x)=>Math.max(m, Number(x.usd||0)), 0),
+    }
+  };
 }
 
 
@@ -1201,7 +1259,6 @@ io.on("connection", (socket) => {
     game.biz.move[playerId] = { marketId, committed:true, ts: now() };
     markCommitted(game, playerId, { kind: "MOVE", marketId });
 
-    updateCountdown(game);
     ackOk(cb);
     broadcast(game);
   });
@@ -1492,6 +1549,50 @@ io.on("connection", (socket) => {
     broadcast(game);
   });
 
+  socket.on("set_audit_lawyer_plan", (payload, cb) => {
+    const { gameId, playerId: payloadPlayerId, immediateUses } = payload || {};
+    const game = getGame(gameId);
+    if(!game) return ackErr(cb, "Game not found", "NOT_FOUND");
+    const playerId = resolveActorPlayerId(socket, game, payloadPlayerId);
+    if(!playerId) return ackErr(cb, "Unknown player", "NO_PLAYER");
+    if(game.phase!=="SETTLE") return ackErr(cb, "Not SETTLE phase", "BAD_STATE");
+    if(game.settle?.entries?.[playerId]?.committed) return ackErr(cb, "Audit už byl potvrzen.", "BAD_STATE");
+
+    const inv = game.inventory[playerId] || blankInventory();
+    const lawyers = (inv.experts||[]).filter(e=>e.functionKey==="LAWYER_TRENDS" && !e.used);
+    const available = lawyers.length;
+    if(!available) return ackErr(cb, "Nemáš právníka.", "NO_POWER");
+    if(game.settle?.lawyerPlans?.[playerId]) return ackErr(cb, "Plán právníka už byl potvrzen.", "BAD_STATE");
+
+    const values = getAuditLawyerImmediateValues(game, playerId);
+    const maxImmediateUses = Math.min(available, values.length);
+    const selectedImmediate = Math.max(0, Math.min(Number(immediateUses||0), maxImmediateUses));
+    const immediateGain = values.slice(0, selectedImmediate).reduce((s,x)=>s + Number(x.usd||0), 0);
+    const shieldUses = Math.max(0, available - selectedImmediate);
+
+    for(const ex of lawyers){ ex.used = true; }
+
+    game.settle.lawyerPlans[playerId] = {
+      immediateUses: selectedImmediate,
+      shieldUses,
+      immediateGain,
+      immediateValues: values.slice(0, selectedImmediate)
+    };
+
+    try{
+      for(const p of game.players){
+        const pid = p.playerId;
+        if(game.settle.entries?.[pid]?.committed){
+          const { settlementUsd, breakdown } = calcSettlementFor(game, pid);
+          game.settle.entries[pid] = { ...game.settle.entries[pid], settlementUsd, breakdown };
+        }
+      }
+    }catch(e){}
+
+    ackOk(cb, { immediateUses: selectedImmediate, shieldUses, immediateGain });
+    broadcast(game);
+  });
+
   // V33: Audit lobbyist actions (sabotage / steal) – consumes one unused STEAL_BASE_PROD expert.
   socket.on("apply_audit_lobbyist", (payload, cb) => {
     const { gameId, playerId, action, targetPlayerId } = payload || {};
@@ -1550,7 +1651,8 @@ io.on("connection", (socket) => {
     game.lawyer = game.lawyer || {};
     game.lawyer.auditShield = game.lawyer.auditShield || {};
     game.lawyer.auditShield[playerId] = game.lawyer.auditShield[playerId] || {};
-    game.lawyer.auditShield[playerId][y] = true;
+    const prevShield = game.lawyer.auditShield[playerId][y]===true ? 1 : Number(game.lawyer.auditShield[playerId][y]||0);
+    game.lawyer.auditShield[playerId][y] = prevShield + 1;
 
     ex.used = true;
 
@@ -1596,7 +1698,15 @@ io.on("connection", (socket) => {
       const p = game.players.find(x=>x.playerId===playerId);
       if(!p) return ackErr(cb, "Neplatný hráč.");
       const { settlementUsd, breakdown } = calcSettlementFor(game, playerId);
-      return ackOk(cb, { settlementUsd, breakdown });
+      const rates = game.crypto?.rates || {};
+      const walletCrypto = (p?.wallet?.crypto) || {};
+      const cryptoPortfolioUsd =
+        Number(walletCrypto.BTC||0) * Number(rates.BTC||0) +
+        Number(walletCrypto.ETH||0) * Number(rates.ETH||0) +
+        Number(walletCrypto.LTC||0) * Number(rates.LTC||0) +
+        Number(walletCrypto.SIA||0) * Number(rates.SIA||0);
+      const experts = getAuditExpertPreview(game, playerId);
+      return ackOk(cb, { settlementUsd, breakdown, cryptoPortfolioUsd, experts });
     }catch(e){
       return ackErr(cb, "Chyba preview auditu.");
     }
